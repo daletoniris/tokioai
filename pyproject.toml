@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokioai"
+version = "5.0.0"
+description = "TokioAI — Cybersecurity, DevOps, Engineering."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "pyreadline3>=3.4; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=0.43.0"]
+vertex = ["anthropic[vertex]>=0.43.0"]
+openai = ["openai>=1.0"]
+gemini = ["google-genai>=1.0"]
+ssh = ["paramiko>=3.0"]
+all = [
+    "anthropic[vertex]>=0.43.0",
+    "openai>=1.0",
+    "google-genai>=1.0",
+    "paramiko>=3.0",
+]
+
+[project.scripts]
+tokioai = "tokioai_cli.interactive:main"
+tokio = "tokioai_cli.interactive:main"
+
+[tool.setuptools.packages.find]
+include = ["tokioai_cli*"]

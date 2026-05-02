@@ -1,0 +1,18 @@
+# TokioAI dependencies
+# Best: pip install -e ".[all]"
+# Or install individual providers:
+
+# Claude (Vertex AI or API)
+anthropic[vertex]>=0.43.0
+
+# OpenAI / OpenRouter / Ollama
+openai>=1.0
+
+# Gemini (API key or Vertex AI)
+google-genai>=1.0
+
+# SSH to servers (optional)
+paramiko>=3.0
+
+# Windows readline (auto-installed on Windows)
+# pyreadline3>=3.4
