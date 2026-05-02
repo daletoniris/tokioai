@@ -17,6 +17,11 @@ from typing import Optional, Set, Callable
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+# ── Silence noisy SDK loggers (httpx/httpcore spam on Windows) ──
+import logging
+for _noisy in ("httpx", "httpcore", "anthropic", "openai", "google"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # ── Cross-platform readline ─────────────────────────
 if _IS_WINDOWS:
     try:
@@ -581,12 +586,32 @@ def _mask_sensitive(text: str) -> str:
 # Tool Display
 # ═══════════════════════════════════════════════════════
 
-TOOL_ICONS = {
-    "execute_local": "⚡", "execute_raspi": "🍓", "execute_gcp": "☁️",
-    "execute_router": "📡", "read_file": "📖", "write_file": "✏️",
-    "edit_file": "🔧", "search_files": "🔍", "diagnose": "🩺",
-    "ssh_connect": "🔑",
-}
+if _IS_WINDOWS:
+    TOOL_ICONS = {
+        "execute_local": ">", "execute_raspi": ">", "execute_gcp": ">",
+        "execute_router": ">", "read_file": "R", "write_file": "W",
+        "edit_file": "E", "search_files": "?", "diagnose": "+",
+        "ssh_connect": "@",
+    }
+    _ICON_OK = "+"
+    _ICON_FAIL = "x"
+    _ICON_TIME = "T"
+    _ICON_TOOLS = "#"
+    _ICON_STATS = "*"
+    _ICON_COST = "$"
+else:
+    TOOL_ICONS = {
+        "execute_local": "⚡", "execute_raspi": "🍓", "execute_gcp": "☁️",
+        "execute_router": "📡", "read_file": "📖", "write_file": "✏️",
+        "edit_file": "🔧", "search_files": "🔍", "diagnose": "🩺",
+        "ssh_connect": "🔑",
+    }
+    _ICON_OK = "✓"
+    _ICON_FAIL = "✗"
+    _ICON_TIME = "⏱"
+    _ICON_TOOLS = "🔧"
+    _ICON_STATS = "📊"
+    _ICON_COST = "💰"
 
 def _format_tool_start(name: str, args: dict) -> str:
     icon = TOOL_ICONS.get(name, "🔧")
@@ -610,13 +635,13 @@ def _format_tool_start(name: str, args: dict) -> str:
 
 def _format_tool_result(name: str, output: str) -> str:
     if not output or not output.strip():
-        return f"    {C_BRIGHT_GREEN}✓{C_RESET} {C_GRAY}done{C_RESET}"
+        return f"    {C_BRIGHT_GREEN}{_ICON_OK}{C_RESET} {C_GRAY}done{C_RESET}"
     preview = _mask_sensitive(output.strip().replace("\n", " ")[:150])
-    truncated = '…' if len(output.strip()) > 150 else ''
+    truncated = '...' if len(output.strip()) > 150 else ''
     is_error = any(e in output.strip().lower()[:100] for e in ['error', 'traceback', 'exception', 'failed'])
     if is_error:
-        return f"    {C_BRIGHT_RED}✗{C_RESET} {C_GRAY}{preview}{truncated}{C_RESET}"
-    return f"    {C_BRIGHT_GREEN}✓{C_RESET} {C_GRAY}{preview}{truncated}{C_RESET}"
+        return f"    {C_BRIGHT_RED}{_ICON_FAIL}{C_RESET} {C_GRAY}{preview}{truncated}{C_RESET}"
+    return f"    {C_BRIGHT_GREEN}{_ICON_OK}{C_RESET} {C_GRAY}{preview}{truncated}{C_RESET}"
 
 
 # ═══════════════════════════════════════════════════════
@@ -1144,36 +1169,90 @@ def _show_config():
 # Process Message
 # ═══════════════════════════════════════════════════════
 
+_SPINNER_CHARS = ["|", "/", "-", "\\"]
+
+
+class _Spinner:
+    """Simple spinner that runs in a background thread while the model thinks."""
+
+    def __init__(self, label="Thinking"):
+        import threading
+        self._label = label
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        import threading
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def update_label(self, label):
+        self._label = label
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        # Clear the spinner line
+        _safe_write(f"\r{' ' * 60}\r")
+
+    def _run(self):
+        i = 0
+        t0 = time.time()
+        while not self._stop.is_set():
+            elapsed = time.time() - t0
+            ch = _SPINNER_CHARS[i % len(_SPINNER_CHARS)]
+            _safe_write(f"\r  {C_BRIGHT_CYAN}{ch}{C_RESET} {C_GRAY}{self._label}... {elapsed:.0f}s{C_RESET}")
+            i += 1
+            self._stop.wait(0.15)
+
+
 def process_message(ops: TokioOps, user_input: str):
     """Process a user message. 100% synchronous — NEVER touches terminal modes."""
     t0 = time.time()
     tool_count = 0
+    spinner = _Spinner("Thinking")
+    spinner.start()
 
     def on_tool_start(name, args):
         nonlocal tool_count
         tool_count += 1
+        spinner.stop()
         _safe_print(_format_tool_start(name, args))
+        spinner.update_label(f"Running {name}")
+        spinner.start()
 
     def on_tool_end(name, result):
+        spinner.stop()
         _safe_print(_format_tool_result(name, result))
+        spinner.update_label("Thinking")
+        spinner.start()
 
     text_already_printed = False
 
     def on_text(text):
         nonlocal text_already_printed
+        spinner.stop()
         rendered = MarkdownRenderer.render(_mask_sensitive(text))
         _safe_print(f"\n{rendered}")
         text_already_printed = True
+        spinner.update_label("Thinking")
+        spinner.start()
 
     try:
         result = ops.chat(user_input, on_tool_start=on_tool_start,
                           on_tool_end=on_tool_end, on_text=on_text)
     except KeyboardInterrupt:
-        _safe_print(f"\n  {C_BRIGHT_YELLOW}⛔ Cancelled{C_RESET}")
+        spinner.stop()
+        _safe_print(f"\n  {C_BRIGHT_YELLOW}Cancelled{C_RESET}")
         return
     except Exception as e:
-        _safe_print(f"\n  {C_BRIGHT_RED}✗ Error: {e}{C_RESET}")
+        spinner.stop()
+        _safe_print(f"\n  {C_BRIGHT_RED}{_ICON_FAIL} Error: {e}{C_RESET}")
         return
+
+    spinner.stop()
 
     if result and not text_already_printed:
         rendered = MarkdownRenderer.render(_mask_sensitive(result))
@@ -1183,12 +1262,12 @@ def process_message(ops: TokioOps, user_input: str):
     elapsed = time.time() - t0
     parts = []
     if elapsed >= 60:
-        parts.append(f"⏱ {int(elapsed // 60)}m{int(elapsed % 60)}s")
+        parts.append(f"{_ICON_TIME} {int(elapsed // 60)}m{int(elapsed % 60)}s")
     else:
-        parts.append(f"⏱ {elapsed:.1f}s")
+        parts.append(f"{_ICON_TIME} {elapsed:.1f}s")
     if tool_count > 0:
-        parts.append(f"🔧 {tool_count} tools")
-    parts.append(f"📊 {ops.token_usage_str}")
+        parts.append(f"{_ICON_TOOLS} {tool_count} tools")
+    parts.append(f"{_ICON_STATS} {ops.token_usage_str}")
 
     # Cost tracking — use DELTA tokens, not cumulative total
     input_t = ops._total_input_tokens
@@ -1200,7 +1279,7 @@ def process_message(ops: TokioOps, user_input: str):
     if delta_in > 0 or delta_out > 0:
         _cost_tracker.add_usage(ops.model, delta_in, delta_out)
         this_cost = _cost_tracker.estimate_single(ops.model, delta_in, delta_out)
-        parts.append(f"💰 ~{this_cost} (session: {_cost_tracker.format_cost()})")
+        parts.append(f"{_ICON_COST} ~{this_cost} (session: {_cost_tracker.format_cost()})")
 
     _safe_print(f"\n  {C_GRAY}{f' {_BOX_V} '.join(parts)}{C_RESET}")
 
