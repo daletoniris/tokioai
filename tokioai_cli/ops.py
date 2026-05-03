@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -164,7 +165,7 @@ def detect_model() -> str:
         "gemini": "gemini-2.5-flash",
         "gemini-vertex": "gemini-3.1-pro-preview",
         "openrouter": "anthropic/claude-opus-4",
-        "ollama": "llama3.1:8b",
+        "ollama": os.getenv("OLLAMA_MODEL", "qwen2.5:32b"),
     }
     return defaults.get(provider, "claude-opus-4-6")
 
@@ -245,7 +246,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute (bash)"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 300)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 120)"},
             },
             "required": ["command"],
         },
@@ -257,7 +258,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Command to run on Raspi"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 300)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 120)"},
             },
             "required": ["command"],
         },
@@ -269,7 +270,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Command to run on GCP"},
-                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 300)"},
+                "timeout": {"type": "integer", "description": "Timeout in seconds (default 30, max 120)"},
             },
             "required": ["command"],
         },
@@ -384,12 +385,12 @@ def _run_cmd(cmd: str, timeout: int = 30) -> str:
             text=True,
             encoding='utf-8',
             errors='replace',
-            timeout=min(timeout, 300),
+            timeout=min(timeout, 120),
         )
         out = (r.stdout + r.stderr).strip()
         return out[:16000] if out else "(no output)"
     except subprocess.TimeoutExpired:
-        return f"TIMEOUT after {timeout}s"
+        return f"TIMEOUT after {timeout}s — the command took too long. Try a different approach, break it into smaller steps, or inform the user."
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -782,6 +783,30 @@ def _tools_to_openai(tools: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Retry with exponential backoff + jitter (Claude Code pattern)
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_ERRORS = (
+    "overloaded", "rate_limit", "rate limit", "429", "503", "502",
+    "server_error", "internal_error", "temporarily unavailable",
+    "capacity", "too many requests", "service unavailable",
+    "connection", "timeout", "timed out",
+)
+
+def _should_retry(error_str: str) -> bool:
+    """Check if an API error is retryable."""
+    lower = error_str.lower()
+    return any(k in lower for k in _RETRYABLE_ERRORS)
+
+def _backoff_delay(attempt: int, base: float = 1.0, cap: float = 30.0) -> float:
+    """Exponential backoff with full jitter: min(cap, base * 2^attempt) * random(0.5, 1.0)"""
+    delay = min(cap, base * (2 ** attempt))
+    return delay * random.uniform(0.5, 1.0)
+
+MAX_API_RETRIES = 4  # up to 4 retries (5 total attempts)
+
+
+# ---------------------------------------------------------------------------
 # TokioOps — Main engine
 # ---------------------------------------------------------------------------
 
@@ -789,20 +814,34 @@ class TokioOps:
     """TokioAI Operations engine with native tool use."""
 
     # Auto-compact: triggers on message count OR estimated token size
-    COMPACT_THRESHOLD = 16        # compact early to save $$$
+    COMPACT_THRESHOLD = 14        # compact early to save $$$
     COMPACT_KEEP_RECENT = 6       # keep last N messages intact
-    COMPACT_TOKEN_LIMIT = 60000   # compact if estimated tokens exceed this
+    COMPACT_TOKEN_LIMIT = 40000   # compact if estimated tokens exceed this
     MAX_TOOL_RESULT = 8000        # truncate tool results beyond this (chars ~2K tokens)
     # Cheap model for summarization (Sonnet = ~5x cheaper than Opus)
     COMPACT_MODEL = "claude-sonnet-4-20250514"
 
     def __init__(self, provider: str = None, model: str = None):
         self._provider_name = provider or PROVIDER
-        self._model = model or MODEL
+        # If provider was explicitly passed but model wasn't, use correct default for that provider
+        if provider and not model:
+            defaults = {
+                "anthropic-vertex": "claude-opus-4-6",
+                "anthropic": "claude-opus-4-6",
+                "openai": "gpt-4o",
+                "gemini": "gemini-2.5-flash",
+                "gemini-vertex": "gemini-3.1-pro-preview",
+                "openrouter": "anthropic/claude-opus-4",
+                "ollama": os.getenv("OLLAMA_MODEL", "qwen2.5:32b"),
+                "local": os.getenv("OLLAMA_MODEL", "qwen2.5:32b"),
+            }
+            self._model = defaults.get(provider, MODEL)
+        else:
+            self._model = model or MODEL
         self._client, self._client_type = init_client(self._provider_name)
         self._messages: list[dict] = []
         self._gemini_history: list = []  # Persistent Gemini contents
-        self._max_turns = 100
+        self._max_turns = 25
         self._max_rounds = 25
         self._max_time = 600
         self._total_input_tokens = 0
@@ -810,6 +849,30 @@ class TokioOps:
         self._last_tracked_input = 0
         self._last_tracked_output = 0
         self._compaction_count = 0
+        self._compact_failures = 0  # circuit breaker for compact
+        self._state = "idle"  # state machine: idle → thinking → tool_exec → done
+        self._hooks: dict[str, list[Callable]] = {}  # event → [callbacks]
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def on(self, event: str, callback: Callable):
+        """Register a hook callback. Events: pre_tool, post_tool, pre_api, post_api, state_change."""
+        self._hooks.setdefault(event, []).append(callback)
+
+    def _emit(self, event: str, **kwargs):
+        """Emit a hook event to all registered callbacks."""
+        for cb in self._hooks.get(event, []):
+            try:
+                cb(**kwargs)
+            except Exception:
+                pass
+
+    def _set_state(self, new_state: str):
+        old = self._state
+        self._state = new_state
+        self._emit("state_change", old_state=old, new_state=new_state)
 
     @property
     def model(self) -> str:
@@ -912,11 +975,15 @@ class TokioOps:
 
     def _compact_messages(self, on_text=None):
         """Auto-compact old messages into a summary when conversation gets too long."""
+        if self._compact_failures >= 3:
+            return  # circuit breaker — stop trying after 3 failures
         est_tokens = self._estimate_tokens()
         needs_compact = (len(self._messages) >= self.COMPACT_THRESHOLD or
                          est_tokens > self.COMPACT_TOKEN_LIMIT)
         if not needs_compact:
             return
+        if on_text:
+            on_text(f"\n[Auto-compacting context: {len(self._messages)} messages, ~{est_tokens} tokens]\n")
 
         cut_idx = self._find_safe_cut(self.COMPACT_KEEP_RECENT)
         if cut_idx <= 2:
@@ -1008,11 +1075,22 @@ class TokioOps:
         if on_text:
             on_text(f"\n⚡ Context compacted ({len(old_msgs)} messages summarized, keeping {len(recent_msgs)} recent)\n")
 
-    def chat(self, user_input: str, on_tool_start=None, on_tool_end=None, on_text=None) -> str:
-        """Process a user request with tool use. Fully synchronous — NEVER touches terminal."""
+    def chat(self, user_input: str, on_tool_start=None, on_tool_end=None,
+             on_text=None, on_token=None, stream=False) -> str:
+        """Process a user request with tool use.
+
+        Args:
+            on_token: Called with each text token during streaming (token: str).
+                      If provided and stream=True, tokens are emitted incrementally.
+            stream: Enable streaming mode (token-by-token output).
+        """
         if self._client_type == "anthropic":
+            if stream and on_token:
+                return self._chat_anthropic_stream(user_input, on_tool_start, on_tool_end, on_text, on_token)
             return self._chat_anthropic(user_input, on_tool_start, on_tool_end, on_text)
         elif self._client_type == "openai":
+            if stream and on_token:
+                return self._chat_openai_stream(user_input, on_tool_start, on_tool_end, on_text, on_token)
             return self._chat_openai(user_input, on_tool_start, on_tool_end, on_text)
         elif self._client_type == "gemini":
             return self._chat_gemini(user_input, on_tool_start, on_tool_end, on_text)
@@ -1024,30 +1102,57 @@ class TokioOps:
     def _chat_anthropic(self, user_input, on_tool_start, on_tool_end, on_text) -> str:
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
 
-        for turn in range(self._max_turns):
-            try:
-                response = self._client.messages.create(
-                    model=self._model,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    messages=self._messages,
-                    timeout=120.0,
-                )
-            except Exception as e:
-                err_str = str(e).lower()
-                # Auto-compact on context length errors and retry once
-                if any(k in err_str for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
-                    if len(self._messages) > 6:
-                        self._compact_messages(on_text)
-                        continue  # retry with compacted context
-                return f"API Error: {e}"
+        for turn in range(effective_limit):
+            # API call with exponential backoff on retryable errors
+            response = None
+            for attempt in range(MAX_API_RETRIES + 1):
+                try:
+                    response = self._client.messages.create(
+                        model=self._model,
+                        max_tokens=MAX_TOKENS,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=self._messages,
+                        timeout=120.0,
+                    )
+                    break  # success
+                except Exception as e:
+                    err_str = str(e)
+                    # Context length errors — compact and retry (no backoff needed)
+                    if any(k in err_str.lower() for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
+                        before = len(self._messages)
+                        if before > 6:
+                            self._compact_messages(on_text)
+                            if len(self._messages) < before:
+                                break  # will retry via outer loop
+                        return f"API Error: {e}"
+                    # Retryable errors — backoff
+                    if _should_retry(err_str) and attempt < MAX_API_RETRIES:
+                        delay = _backoff_delay(attempt)
+                        if on_text:
+                            on_text(f"\n[API error, retrying in {delay:.1f}s... ({attempt+1}/{MAX_API_RETRIES})]\n")
+                        time.sleep(delay)
+                        continue
+                    return f"API Error: {e}"
+            if response is None:
+                continue  # compacted, retry outer loop
 
             # Track tokens
             if hasattr(response, "usage"):
                 self._total_input_tokens += getattr(response.usage, "input_tokens", 0)
                 self._total_output_tokens += getattr(response.usage, "output_tokens", 0)
+
+            # Detect max_tokens truncation — retry with resume prompt (Claude Code pattern)
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                text_so_far = "".join(b.text for b in response.content if hasattr(b, "text") and b.text)
+                if text_so_far:
+                    self._messages.append({"role": "assistant", "content": text_so_far})
+                    self._messages.append({"role": "user", "content": "[Your response was cut off. Resume directly from where you stopped — do not repeat anything.]"})
+                    if on_text:
+                        on_text(text_so_far)
+                    continue  # retry to get the rest
 
             # Check for tool use
             tool_blocks = [b for b in response.content if b.type == "tool_use"]
@@ -1058,23 +1163,48 @@ class TokioOps:
                     if hasattr(block, "text") and block.text and on_text:
                         on_text(block.text)
 
-                self._messages.append({"role": "assistant", "content": response.content})
+                # Serialize API objects to plain dicts so session save (JSON) works
+                serialized_content = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        serialized_content.append({
+                            "type": "tool_use", "id": block.id,
+                            "name": block.name, "input": block.input,
+                        })
+                    elif hasattr(block, "text"):
+                        serialized_content.append({"type": "text", "text": block.text or ""})
+                    else:
+                        serialized_content.append({"type": block.type})
+                self._messages.append({"role": "assistant", "content": serialized_content})
 
                 tool_results = []
-                for tb in tool_blocks:
-                    if on_tool_start:
-                        on_tool_start(tb.name, tb.input)
-                    result = execute_tool(tb.name, tb.input)
-                    if on_tool_end:
-                        on_tool_end(tb.name, result)
-                    # Truncate very large tool results to avoid blowing context
-                    if len(result) > self.MAX_TOOL_RESULT:
-                        result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tb.id,
-                        "content": result,
-                    })
+                try:
+                    for tb in tool_blocks:
+                        if on_tool_start:
+                            on_tool_start(tb.name, tb.input)
+                        result = execute_tool(tb.name, tb.input)
+                        if on_tool_end:
+                            on_tool_end(tb.name, result)
+                        # Truncate very large tool results to avoid blowing context
+                        if len(result) > self.MAX_TOOL_RESULT:
+                            result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tb.id,
+                            "content": result,
+                        })
+                except KeyboardInterrupt:
+                    # User cancelled — fill missing tool_results to keep history valid
+                    answered_ids = {tr["tool_use_id"] for tr in tool_results}
+                    for tb in tool_blocks:
+                        if tb.id not in answered_ids:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tb.id,
+                                "content": "Cancelled by user.",
+                            })
+                    self._messages.append({"role": "user", "content": tool_results})
+                    raise  # re-raise so interactive.py catches it
 
                 self._messages.append({"role": "user", "content": tool_results})
 
@@ -1084,10 +1214,179 @@ class TokioOps:
                 for block in response.content:
                     if hasattr(block, "text"):
                         text += block.text
+                if not text.strip():
+                    text = "[TokioAI stopped without a response. Type your message to continue, or 'reset' to start over.]"
                 self._messages.append({"role": "assistant", "content": text})
                 return text
 
-        return "Max tool turns reached."
+        return f"Max tool turns reached ({effective_limit} rounds). You can continue the conversation or type 'reset' to start fresh."
+
+    # ── Anthropic Streaming ─────────────────────────
+
+    def _chat_anthropic_stream(self, user_input, on_tool_start, on_tool_end, on_text, on_token) -> str:
+        """Anthropic chat with streaming — tokens emitted as they arrive."""
+        self._compact_messages(on_text)
+        self._messages.append({"role": "user", "content": user_input})
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+
+        for turn in range(effective_limit):
+            self._set_state("thinking")
+            self._emit("pre_api", model=self._model, turn=turn)
+            # API call with backoff
+            stream_obj = None
+            for attempt in range(MAX_API_RETRIES + 1):
+                try:
+                    stream_obj = self._client.messages.create(
+                        model=self._model,
+                        max_tokens=MAX_TOKENS,
+                        system=SYSTEM_PROMPT,
+                        tools=TOOLS,
+                        messages=self._messages,
+                        timeout=120.0,
+                        stream=True,
+                    )
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if any(k in err_str.lower() for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
+                        before = len(self._messages)
+                        if before > 6:
+                            self._compact_messages(on_text)
+                            if len(self._messages) < before:
+                                break
+                        return f"API Error: {e}"
+                    if _should_retry(err_str) and attempt < MAX_API_RETRIES:
+                        delay = _backoff_delay(attempt)
+                        if on_text:
+                            on_text(f"\n[API error, retrying in {delay:.1f}s... ({attempt+1}/{MAX_API_RETRIES})]\n")
+                        time.sleep(delay)
+                        continue
+                    return f"API Error: {e}"
+            if stream_obj is None:
+                continue
+
+            # Consume stream events
+            text_chunks = []
+            tool_blocks = []
+            current_tool = None
+            tool_json_acc = ""
+            input_tokens = 0
+            output_tokens = 0
+            stop_reason = None
+
+            try:
+                for event in stream_obj:
+                    etype = getattr(event, "type", "")
+
+                    if etype == "message_start":
+                        usage = getattr(getattr(event, "message", None), "usage", None)
+                        if usage:
+                            input_tokens += getattr(usage, "input_tokens", 0)
+
+                    elif etype == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", "") == "tool_use":
+                            current_tool = {"type": "tool_use", "id": block.id, "name": block.name, "input": {}}
+                            tool_json_acc = ""
+
+                    elif etype == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            if getattr(delta, "type", "") == "text_delta":
+                                chunk = getattr(delta, "text", "")
+                                if chunk:
+                                    text_chunks.append(chunk)
+                                    on_token(chunk)
+                            elif getattr(delta, "type", "") == "input_json_delta":
+                                tool_json_acc += getattr(delta, "partial_json", "")
+
+                    elif etype == "content_block_stop":
+                        if current_tool:
+                            try:
+                                current_tool["input"] = json.loads(tool_json_acc) if tool_json_acc else {}
+                            except json.JSONDecodeError:
+                                current_tool["input"] = {}
+                            tool_blocks.append(current_tool)
+                            current_tool = None
+                            tool_json_acc = ""
+
+                    elif etype == "message_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            stop_reason = getattr(delta, "stop_reason", stop_reason)
+                        usage = getattr(event, "usage", None)
+                        if usage:
+                            output_tokens += getattr(usage, "output_tokens", 0)
+
+            except KeyboardInterrupt:
+                # Partial text already streamed — save what we have
+                partial = "".join(text_chunks)
+                if partial:
+                    self._messages.append({"role": "assistant", "content": partial})
+                raise
+
+            self._total_input_tokens += input_tokens
+            self._total_output_tokens += output_tokens
+
+            full_text = "".join(text_chunks)
+
+            # Max tokens truncation — resume
+            if stop_reason == "max_tokens" and full_text.strip():
+                self._messages.append({"role": "assistant", "content": full_text})
+                self._messages.append({"role": "user", "content": "[Your response was cut off. Resume directly from where you stopped — do not repeat anything.]"})
+                continue
+
+            if tool_blocks:
+                # Build serialized content for message history
+                serialized = []
+                if full_text:
+                    serialized.append({"type": "text", "text": full_text})
+                for tb in tool_blocks:
+                    serialized.append(tb)
+                self._messages.append({"role": "assistant", "content": serialized})
+
+                # Execute tools
+                self._set_state("tool_exec")
+                tool_results = []
+                try:
+                    for tb in tool_blocks:
+                        self._emit("pre_tool", name=tb["name"], input=tb["input"])
+                        if on_tool_start:
+                            on_tool_start(tb["name"], tb["input"])
+                        result = execute_tool(tb["name"], tb["input"])
+                        self._emit("post_tool", name=tb["name"], result=result)
+                        if on_tool_end:
+                            on_tool_end(tb["name"], result)
+                        if len(result) > self.MAX_TOOL_RESULT:
+                            result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tb["id"],
+                            "content": result,
+                        })
+                except KeyboardInterrupt:
+                    answered_ids = {tr["tool_use_id"] for tr in tool_results}
+                    for tb in tool_blocks:
+                        if tb["id"] not in answered_ids:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tb["id"],
+                                "content": "Cancelled by user.",
+                            })
+                    self._messages.append({"role": "user", "content": tool_results})
+                    raise
+
+                self._messages.append({"role": "user", "content": tool_results})
+            else:
+                if not full_text.strip():
+                    full_text = "[TokioAI stopped without a response. Type your message to continue, or 'reset' to start over.]"
+                    on_token(full_text)
+                self._messages.append({"role": "assistant", "content": full_text})
+                self._set_state("idle")
+                return full_text
+
+        self._set_state("idle")
+        return f"Max tool turns reached ({effective_limit} rounds). You can continue the conversation or type 'reset' to start fresh."
 
     # ── OpenAI / OpenRouter / Ollama ───────────────────
 
@@ -1095,24 +1394,42 @@ class TokioOps:
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
         openai_tools = _tools_to_openai(TOOLS)
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
 
-        for turn in range(self._max_turns):
-            try:
-                msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self._messages
-                response = self._client.chat.completions.create(
-                    model=self._model,
-                    messages=msgs,
-                    tools=openai_tools,
-                    max_tokens=MAX_TOKENS,
-                    timeout=120.0,
-                )
-            except Exception as e:
-                err_str = str(e).lower()
-                if any(k in err_str for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
-                    if len(self._messages) > 6:
-                        self._compact_messages(on_text)
+        for turn in range(effective_limit):
+            self._set_state("thinking")
+            self._emit("pre_api", provider="openai", turn=turn)
+            # API call with exponential backoff
+            response = None
+            for attempt in range(MAX_API_RETRIES + 1):
+                try:
+                    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self._messages
+                    response = self._client.chat.completions.create(
+                        model=self._model,
+                        messages=msgs,
+                        tools=openai_tools,
+                        max_tokens=MAX_TOKENS,
+                        timeout=120.0,
+                    )
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if any(k in err_str.lower() for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
+                        before = len(self._messages)
+                        if before > 6:
+                            self._compact_messages(on_text)
+                            if len(self._messages) < before:
+                                break
+                        return f"API Error: {e}"
+                    if _should_retry(err_str) and attempt < MAX_API_RETRIES:
+                        delay = _backoff_delay(attempt)
+                        if on_text:
+                            on_text(f"\n[API error, retrying in {delay:.1f}s... ({attempt+1}/{MAX_API_RETRIES})]\n")
+                        time.sleep(delay)
                         continue
-                return f"API Error: {e}"
+                    return f"API Error: {e}"
+            if response is None:
+                continue
 
             # Track tokens
             if hasattr(response, "usage") and response.usage:
@@ -1122,34 +1439,241 @@ class TokioOps:
             choice = response.choices[0]
             msg = choice.message
 
+            # Detect max_tokens truncation — retry with resume prompt
+            if getattr(choice, "finish_reason", None) == "length":
+                text_so_far = choice.message.content or ""
+                if text_so_far.strip():
+                    self._messages.append({"role": "assistant", "content": text_so_far})
+                    self._messages.append({"role": "user", "content": "[Your response was cut off. Resume directly from where you stopped — do not repeat anything.]"})
+                    if on_text:
+                        on_text(text_so_far)
+                    continue
+
             if msg.tool_calls:
-                self._messages.append(msg)
+                # Serialize to plain dict so session save (JSON) works
+                msg_dict = {
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                }
+                self._messages.append(msg_dict)
 
                 # Emit text if any
                 if msg.content and msg.content.strip() and on_text:
                     on_text(msg.content)
 
-                for tc in msg.tool_calls:
-                    fn = tc.function
-                    args = json.loads(fn.arguments) if fn.arguments else {}
-                    if on_tool_start:
-                        on_tool_start(fn.name, args)
-                    result = execute_tool(fn.name, args)
-                    if on_tool_end:
-                        on_tool_end(fn.name, result)
-                    if len(result) > self.MAX_TOOL_RESULT:
-                        result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
-                    self._messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
+                self._set_state("tool_exec")
+                try:
+                    for tc in msg.tool_calls:
+                        fn = tc.function
+                        try:
+                            args = json.loads(fn.arguments) if fn.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                            result = f"ERROR: Malformed tool arguments: {fn.arguments[:200]}"
+                            if on_tool_end:
+                                on_tool_end(fn.name, result)
+                            self._messages.append({
+                                "role": "tool", "tool_call_id": tc.id, "content": result,
+                            })
+                            continue
+                        self._emit("pre_tool", name=fn.name, input=args)
+                        if on_tool_start:
+                            on_tool_start(fn.name, args)
+                        result = execute_tool(fn.name, args)
+                        self._emit("post_tool", name=fn.name, result=result)
+                        if on_tool_end:
+                            on_tool_end(fn.name, result)
+                        if len(result) > self.MAX_TOOL_RESULT:
+                            result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                except KeyboardInterrupt:
+                    answered_ids = {m["tool_call_id"] for m in self._messages if isinstance(m, dict) and m.get("role") == "tool"}
+                    for tc in msg.tool_calls:
+                        if tc.id not in answered_ids:
+                            self._messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": "Cancelled by user.",
+                            })
+                    raise
             else:
                 text = msg.content or ""
+                if not text.strip():
+                    text = "[TokioAI stopped without a response. Type your message to continue, or 'reset' to start over.]"
                 self._messages.append({"role": "assistant", "content": text})
+                self._set_state("idle")
                 return text
 
-        return "Max tool turns reached."
+        self._set_state("idle")
+        return f"Max tool turns reached ({effective_limit} rounds). You can continue the conversation or type 'reset' to start fresh."
+
+    # ── OpenAI Streaming ────────────────────────────
+
+    def _chat_openai_stream(self, user_input, on_tool_start, on_tool_end, on_text, on_token) -> str:
+        """OpenAI chat with streaming — tokens emitted as they arrive."""
+        self._compact_messages(on_text)
+        self._messages.append({"role": "user", "content": user_input})
+        openai_tools = _tools_to_openai(TOOLS)
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+
+        for turn in range(effective_limit):
+            stream_obj = None
+            for attempt in range(MAX_API_RETRIES + 1):
+                try:
+                    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self._messages
+                    stream_obj = self._client.chat.completions.create(
+                        model=self._model,
+                        messages=msgs,
+                        tools=openai_tools,
+                        max_tokens=MAX_TOKENS,
+                        timeout=120.0,
+                        stream=True,
+                    )
+                    break
+                except Exception as e:
+                    err_str = str(e)
+                    if any(k in err_str.lower() for k in ("prompt is too long", "context length", "max_tokens", "token limit", "request too large")):
+                        before = len(self._messages)
+                        if before > 6:
+                            self._compact_messages(on_text)
+                            if len(self._messages) < before:
+                                break
+                        return f"API Error: {e}"
+                    if _should_retry(err_str) and attempt < MAX_API_RETRIES:
+                        delay = _backoff_delay(attempt)
+                        if on_text:
+                            on_text(f"\n[API error, retrying in {delay:.1f}s... ({attempt+1}/{MAX_API_RETRIES})]\n")
+                        time.sleep(delay)
+                        continue
+                    return f"API Error: {e}"
+            if stream_obj is None:
+                continue
+
+            # Consume stream
+            text_chunks = []
+            tool_calls_acc = {}  # id -> {name, arguments}
+            finish_reason = None
+
+            try:
+                for chunk in stream_obj:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    finish_reason = chunk.choices[0].finish_reason or finish_reason
+
+                    # Text tokens
+                    if delta.content:
+                        text_chunks.append(delta.content)
+                        on_token(delta.content)
+
+                    # Tool call deltas
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "name": "",
+                                    "arguments": "",
+                                }
+                            if tc_delta.id:
+                                tool_calls_acc[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_acc[idx]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+                    # Usage (some providers send it in the last chunk)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        self._total_input_tokens += getattr(chunk.usage, "prompt_tokens", 0)
+                        self._total_output_tokens += getattr(chunk.usage, "completion_tokens", 0)
+
+            except KeyboardInterrupt:
+                partial = "".join(text_chunks)
+                if partial:
+                    self._messages.append({"role": "assistant", "content": partial})
+                raise
+
+            full_text = "".join(text_chunks)
+
+            # Max tokens truncation
+            if finish_reason == "length" and full_text.strip():
+                self._messages.append({"role": "assistant", "content": full_text})
+                self._messages.append({"role": "user", "content": "[Your response was cut off. Resume directly from where you stopped — do not repeat anything.]"})
+                continue
+
+            if tool_calls_acc:
+                # Build serialized message
+                tc_list = []
+                for idx in sorted(tool_calls_acc):
+                    tc = tool_calls_acc[idx]
+                    tc_list.append({
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    })
+                msg_dict = {
+                    "role": "assistant",
+                    "content": full_text or "",
+                    "tool_calls": tc_list,
+                }
+                self._messages.append(msg_dict)
+
+                if full_text.strip() and on_text:
+                    on_text(full_text)
+
+                # Execute tools
+                try:
+                    for tc in tc_list:
+                        fn_name = tc["function"]["name"]
+                        try:
+                            args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                            result = f"ERROR: Malformed tool arguments"
+                            if on_tool_end:
+                                on_tool_end(fn_name, result)
+                            self._messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                            continue
+                        if on_tool_start:
+                            on_tool_start(fn_name, args)
+                        result = execute_tool(fn_name, args)
+                        if on_tool_end:
+                            on_tool_end(fn_name, result)
+                        if len(result) > self.MAX_TOOL_RESULT:
+                            result = result[:self.MAX_TOOL_RESULT] + "\n... (truncated)"
+                        self._messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        })
+                except KeyboardInterrupt:
+                    answered_ids = {m["tool_call_id"] for m in self._messages if isinstance(m, dict) and m.get("role") == "tool"}
+                    for tc in tc_list:
+                        if tc["id"] not in answered_ids:
+                            self._messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "Cancelled by user."})
+                    raise
+            else:
+                if not full_text.strip():
+                    full_text = "[TokioAI stopped without a response. Type your message to continue, or 'reset' to start over.]"
+                    on_token(full_text)
+                self._messages.append({"role": "assistant", "content": full_text})
+                return full_text
+
+        return f"Max tool turns reached ({effective_limit} rounds). You can continue the conversation or type 'reset' to start fresh."
 
     # ── Gemini (Google AI — API key) ──────────────────
 
@@ -1200,19 +1724,39 @@ class TokioOps:
                 max_output_tokens=MAX_TOKENS,
             )
 
-            for turn in range(self._max_turns):
-                response = self._client.models.generate_content(
-                    model=self._model,
-                    contents=contents,
-                    config=config,
-                )
+            effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+            for turn in range(effective_limit):
+                self._set_state("thinking")
+                self._emit("pre_api", provider="gemini", turn=turn)
+                # API call with exponential backoff
+                response = None
+                for attempt in range(MAX_API_RETRIES + 1):
+                    try:
+                        response = self._client.models.generate_content(
+                            model=self._model,
+                            contents=contents,
+                            config=config,
+                        )
+                        break
+                    except Exception as e:
+                        if _should_retry(str(e)) and attempt < MAX_API_RETRIES:
+                            delay = _backoff_delay(attempt)
+                            if on_text:
+                                on_text(f"\n[Gemini error, retrying in {delay:.1f}s... ({attempt+1}/{MAX_API_RETRIES})]\n")
+                            time.sleep(delay)
+                            continue
+                        return f"Gemini API Error: {e}"
+                if response is None:
+                    return "Gemini API Error: all retries failed"
 
                 # Track tokens
                 if hasattr(response, "usage_metadata") and response.usage_metadata:
                     self._total_input_tokens += getattr(response.usage_metadata, "prompt_token_count", 0)
                     self._total_output_tokens += getattr(response.usage_metadata, "candidates_token_count", 0)
 
-                # Check for function calls
+                # Guard against empty candidates (safety filters, etc.)
+                if not response.candidates:
+                    return "[Gemini returned no response (possibly filtered). Try rephrasing or use a different model.]"
                 fn_calls = []
                 text_parts = []
                 for part in response.candidates[0].content.parts:
@@ -1227,16 +1771,23 @@ class TokioOps:
                 if not fn_calls:
                     # Save assistant response to persistent history
                     self._gemini_history.append(response.candidates[0].content)
-                    return "\n".join(text_parts)
+                    final_text = "\n".join(text_parts)
+                    if not final_text.strip():
+                        final_text = "[TokioAI stopped without a response. Type your message to continue, or 'reset' to start over.]"
+                    self._set_state("idle")
+                    return final_text
 
                 # Execute function calls
+                self._set_state("tool_exec")
                 contents.append(response.candidates[0].content)
                 fn_response_parts = []
                 for fc in fn_calls:
                     args = dict(fc.args) if fc.args else {}
+                    self._emit("pre_tool", name=fc.name, input=args)
                     if on_tool_start:
                         on_tool_start(fc.name, args)
                     result = execute_tool(fc.name, args)
+                    self._emit("post_tool", name=fc.name, result=result)
                     if on_tool_end:
                         on_tool_end(fc.name, result)
                     fn_response_parts.append(types.Part.from_function_response(
@@ -1251,7 +1802,8 @@ class TokioOps:
 
             # Save final state of conversation to persistent history
             self._gemini_history = contents
-            return "Max tool turns reached."
+            self._set_state("idle")
+            return f"Max tool turns reached ({effective_limit} rounds). You can continue the conversation or type 'reset' to start fresh."
 
         except ImportError:
             return "ERROR: google-genai not installed. Run: pip install google-genai"

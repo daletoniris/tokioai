@@ -284,7 +284,7 @@ _CLI_COMMANDS = [
     "unlimited", "persistent", "stop", "config",
     "/status", "/waf", "/health", "/drone", "/threats", "/entity",
     "/sitrep", "/see", "/containers", "/wifi", "/coffee", "/logs", "/ha", "/picar",
-    "/gcp",
+    "/gcp", "/diff", "/commit", "/branch",
 ]
 
 # Model aliases for "model <tab>" completion
@@ -613,8 +613,10 @@ else:
     _ICON_STATS = "📊"
     _ICON_COST = "💰"
 
+_ICON_DEFAULT = "#" if _IS_WINDOWS else "🔧"
+
 def _format_tool_start(name: str, args: dict) -> str:
-    icon = TOOL_ICONS.get(name, "🔧")
+    icon = TOOL_ICONS.get(name, _ICON_DEFAULT)
     detail = ""
     if "command" in args:
         cmd = _mask_sensitive(str(args["command"])[:100])
@@ -1006,6 +1008,95 @@ def _slash_sitrep():
     _slash_wifi()
 
 
+def _slash_diff():
+    """Show git diff of current directory."""
+    _safe_print(f"\n  {C_BOLD}Git Diff{C_RESET}\n")
+    try:
+        r = _sp.run(["git", "diff", "--stat"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            _safe_print(f"  {C_DIM}Not a git repository{C_RESET}\n")
+            return
+        if not r.stdout.strip():
+            _safe_print(f"  {C_DIM}No changes{C_RESET}\n")
+            return
+        _safe_print(f"  {C_GRAY}{r.stdout.strip()}{C_RESET}")
+        r2 = _sp.run(["git", "diff", "--cached", "--stat"], capture_output=True, text=True, timeout=10)
+        if r2.stdout.strip():
+            _safe_print(f"\n  {C_BOLD}Staged:{C_RESET}")
+            _safe_print(f"  {C_BRIGHT_GREEN}{r2.stdout.strip()}{C_RESET}")
+        r3 = _sp.run(["git", "ls-files", "--others", "--exclude-standard"], capture_output=True, text=True, timeout=10)
+        if r3.stdout.strip():
+            files = r3.stdout.strip().split('\n')[:10]
+            _safe_print(f"\n  {C_BOLD}Untracked ({len(r3.stdout.strip().split(chr(10)))}):{C_RESET}")
+            for f in files:
+                _safe_print(f"  {C_BRIGHT_YELLOW}  {f}{C_RESET}")
+    except Exception as e:
+        _safe_print(f"  {C_BRIGHT_RED}Error: {e}{C_RESET}")
+    _safe_print()
+
+
+def _slash_commit():
+    """Quick git commit — stages all and commits with a message."""
+    _safe_print(f"\n  {C_BOLD}Git Commit{C_RESET}\n")
+    try:
+        r = _sp.run(["git", "status", "--porcelain"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            _safe_print(f"  {C_DIM}Not a git repository{C_RESET}\n")
+            return
+        if not r.stdout.strip():
+            _safe_print(f"  {C_DIM}Nothing to commit{C_RESET}\n")
+            return
+        changes = r.stdout.strip().split('\n')
+        _safe_print(f"  {C_BOLD}Changes ({len(changes)}):{C_RESET}")
+        for c in changes[:15]:
+            status = c[:2]
+            fname = c[3:]
+            color = C_BRIGHT_GREEN if 'A' in status else C_BRIGHT_YELLOW if 'M' in status else C_BRIGHT_RED if 'D' in status else C_DIM
+            _safe_print(f"    {color}{status}{C_RESET} {fname}")
+        if len(changes) > 15:
+            _safe_print(f"    {C_DIM}... and {len(changes) - 15} more{C_RESET}")
+        _safe_print()
+        try:
+            msg = input(f"  {C_BRIGHT_CYAN}Commit message: {C_RESET}").strip()
+        except (EOFError, KeyboardInterrupt):
+            _safe_print(f"\n  {C_DIM}Cancelled{C_RESET}")
+            return
+        if not msg:
+            _safe_print(f"  {C_DIM}Cancelled (empty message){C_RESET}")
+            return
+        _sp.run(["git", "add", "-A"], capture_output=True, timeout=10)
+        r2 = _sp.run(["git", "commit", "-m", msg], capture_output=True, text=True, timeout=15)
+        if r2.returncode == 0:
+            _safe_print(f"  {C_BRIGHT_GREEN}{_ICON_OK} Committed: {msg}{C_RESET}")
+        else:
+            _safe_print(f"  {C_BRIGHT_RED}{_ICON_FAIL} {r2.stderr.strip() or r2.stdout.strip()}{C_RESET}")
+    except Exception as e:
+        _safe_print(f"  {C_BRIGHT_RED}Error: {e}{C_RESET}")
+    _safe_print()
+
+
+def _slash_branch():
+    """Show current git branch and recent commits."""
+    _safe_print(f"\n  {C_BOLD}Git Branch{C_RESET}\n")
+    try:
+        r = _sp.run(["git", "branch", "--show-current"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            _safe_print(f"  {C_DIM}Not a git repository{C_RESET}\n")
+            return
+        branch = r.stdout.strip()
+        _safe_print(f"  Branch: {C_BRIGHT_CYAN}{branch}{C_RESET}")
+        r2 = _sp.run(["git", "log", "--oneline", "-5"], capture_output=True, text=True, timeout=5)
+        if r2.stdout.strip():
+            _safe_print(f"\n  {C_BOLD}Recent commits:{C_RESET}")
+            for line in r2.stdout.strip().split('\n'):
+                hash_part = line[:7]
+                msg_part = line[8:]
+                _safe_print(f"    {C_BRIGHT_YELLOW}{hash_part}{C_RESET} {msg_part}")
+    except Exception as e:
+        _safe_print(f"  {C_BRIGHT_RED}Error: {e}{C_RESET}")
+    _safe_print()
+
+
 _SLASH_COMMANDS = {
     "/status": _slash_status,
     "/waf": _slash_waf,
@@ -1022,6 +1113,9 @@ _SLASH_COMMANDS = {
     "/see": _slash_see,
     "/picar": _slash_picar,
     "/gcp": _slash_gcp,
+    "/diff": _slash_diff,
+    "/commit": _slash_commit,
+    "/branch": _slash_branch,
 }
 
 
@@ -1169,90 +1263,63 @@ def _show_config():
 # Process Message
 # ═══════════════════════════════════════════════════════
 
-_SPINNER_CHARS = ["|", "/", "-", "\\"]
-
-
-class _Spinner:
-    """Simple spinner that runs in a background thread while the model thinks."""
-
-    def __init__(self, label="Thinking"):
-        import threading
-        self._label = label
-        self._stop = threading.Event()
-        self._thread = None
-
-    def start(self):
-        import threading
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def update_label(self, label):
-        self._label = label
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=1)
-        # Clear the spinner line
-        _safe_write(f"\r{' ' * 60}\r")
-
-    def _run(self):
-        i = 0
-        t0 = time.time()
-        while not self._stop.is_set():
-            elapsed = time.time() - t0
-            ch = _SPINNER_CHARS[i % len(_SPINNER_CHARS)]
-            _safe_write(f"\r  {C_BRIGHT_CYAN}{ch}{C_RESET} {C_GRAY}{self._label}... {elapsed:.0f}s{C_RESET}")
-            i += 1
-            self._stop.wait(0.15)
-
-
 def process_message(ops: TokioOps, user_input: str):
-    """Process a user message. 100% synchronous — NEVER touches terminal modes."""
+    """Process a user message with streaming support."""
     t0 = time.time()
     tool_count = 0
-    spinner = _Spinner("Thinking")
-    spinner.start()
 
     def on_tool_start(name, args):
         nonlocal tool_count
         tool_count += 1
-        spinner.stop()
         _safe_print(_format_tool_start(name, args))
-        spinner.update_label(f"Running {name}")
-        spinner.start()
 
     def on_tool_end(name, result):
-        spinner.stop()
         _safe_print(_format_tool_result(name, result))
-        spinner.update_label("Thinking")
-        spinner.start()
 
     text_already_printed = False
+    streaming_buffer = []
 
     def on_text(text):
         nonlocal text_already_printed
-        spinner.stop()
         rendered = MarkdownRenderer.render(_mask_sensitive(text))
         _safe_print(f"\n{rendered}")
         text_already_printed = True
-        spinner.update_label("Thinking")
-        spinner.start()
+
+    def on_token(token):
+        """Stream tokens directly to stdout — raw, no markdown rendering mid-stream."""
+        nonlocal text_already_printed
+        if not streaming_buffer:
+            # First token — print a newline to separate from tool output
+            _safe_write("\n")
+        streaming_buffer.append(token)
+        _safe_write(_mask_sensitive(token))
+        text_already_printed = True
+
+    # Use streaming for Anthropic and OpenAI, fallback for others
+    use_stream = ops._client_type in ("anthropic", "openai")
+
+    if not use_stream:
+        _safe_print(f"  {C_GRAY}Thinking...{C_RESET}")
 
     try:
         result = ops.chat(user_input, on_tool_start=on_tool_start,
-                          on_tool_end=on_tool_end, on_text=on_text)
+                          on_tool_end=on_tool_end, on_text=on_text,
+                          on_token=on_token if use_stream else None,
+                          stream=use_stream)
     except KeyboardInterrupt:
-        spinner.stop()
+        if streaming_buffer:
+            _safe_write("\n")
         _safe_print(f"\n  {C_BRIGHT_YELLOW}Cancelled{C_RESET}")
         return
     except Exception as e:
-        spinner.stop()
+        if streaming_buffer:
+            _safe_write("\n")
         _safe_print(f"\n  {C_BRIGHT_RED}{_ICON_FAIL} Error: {e}{C_RESET}")
         return
 
-    spinner.stop()
+    # End streaming line
+    if streaming_buffer:
+        _safe_write("\n")
 
     if result and not text_already_printed:
         rendered = MarkdownRenderer.render(_mask_sensitive(result))
@@ -1390,11 +1457,9 @@ def run_interactive(
         # Restore terminal to clean state before every prompt
         if _terminal_saved_state and not _IS_WINDOWS:
             try:
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _terminal_saved_state)
-            except Exception:
-                pass
-            try:
-                os.system("stty sane 2>/dev/null")
+                current = termios.tcgetattr(sys.stdin)
+                if current != _terminal_saved_state:
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _terminal_saved_state)
             except Exception:
                 pass
         _flush_stdin()
@@ -1404,8 +1469,11 @@ def run_interactive(
             prompt = f"\n{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
             user_input = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
-            _safe_print(f"\n{C_GRAY}Bye! 👋{C_RESET}")
+            _safe_print(f"\n{C_GRAY}Bye!{C_RESET}")
             break
+        except UnicodeDecodeError:
+            _safe_print(f"  {C_BRIGHT_YELLOW}Input encoding error — try again{C_RESET}")
+            continue
 
         if not user_input:
             continue
@@ -1619,21 +1687,37 @@ def run_interactive(
         # Flush leftover input
         _flush_stdin()
 
-        # Persistent mode loop
+        # Persistent mode loop — fully autonomous
         if _persistent_mode:
             while _persistent_mode:
+                # Auto-continue: check if user typed something (non-blocking), otherwise keep going
                 try:
-                    follow_up = input(
-                        f"\n  {RL_START}{C_GRAY}{RL_END}[persistent]{RL_START}{C_RESET}{RL_END} "
-                        f"{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
-                    ).strip()
+                    import select as _sel
+                    _safe_print(f"\n  {C_GRAY}[persistent] Auto-continuing in 3s... (type 'stop' or Ctrl+C to halt){C_RESET}")
+                    # Wait up to 3 seconds for user input
+                    ready, _, _ = _sel.select([sys.stdin], [], [], 3.0)
+                    if ready:
+                        follow_up = sys.stdin.readline().strip()
+                    else:
+                        follow_up = ""
                 except (EOFError, KeyboardInterrupt):
                     _persistent_mode = False
                     _safe_print(f"\n  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
                     break
+                except Exception:
+                    # select not available (Windows) — fallback to blocking input
+                    try:
+                        follow_up = input(
+                            f"\n  {RL_START}{C_GRAY}{RL_END}[persistent]{RL_START}{C_RESET}{RL_END} "
+                            f"{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
+                        ).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        _persistent_mode = False
+                        _safe_print(f"\n  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
+                        break
                 if not follow_up:
-                    follow_up = "Continua con la tarea. Si terminaste, dime que esta listo."
-                if follow_up.lower() in ("stop", "parar", "detener", "exit"):
+                    follow_up = "Continue with the task. If you finished everything, say DONE and summarize what you did."
+                if follow_up.lower() in ("stop", "parar", "detener", "exit", "done"):
                     _persistent_mode = False
                     ops._max_rounds = 25
                     ops._max_time = 600
