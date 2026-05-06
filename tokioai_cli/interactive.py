@@ -96,8 +96,15 @@ def _signal_handler(signum, frame):
     os.kill(os.getpid(), signum)
 
 
+def _sigint_handler(signum, frame):
+    """SIGINT (Ctrl+C): raise KeyboardInterrupt instead of killing the process.
+    This lets the interactive loop catch it and cancel the current operation
+    without closing the session."""
+    raise KeyboardInterrupt
+
+
 if not _IS_WINDOWS:
-    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGINT, _sigint_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     try:
         signal.signal(signal.SIGHUP, _signal_handler)
@@ -1468,7 +1475,17 @@ def run_interactive(
         try:
             prompt = f"\n{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
             user_input = input(prompt).strip()
-        except (EOFError, KeyboardInterrupt):
+        except KeyboardInterrupt:
+            # Ctrl+C at prompt: cancel current input, NOT exit session
+            _safe_print(f"\n  {C_GRAY}(interrupted — press Ctrl+C again quickly to exit){C_RESET}")
+            # Track rapid double Ctrl+C to exit
+            now = time.time()
+            if hasattr(run_interactive, '_last_ctrlc') and (now - run_interactive._last_ctrlc) < 1.5:
+                _safe_print(f"\n{C_GRAY}Bye!{C_RESET}")
+                break
+            run_interactive._last_ctrlc = now
+            continue
+        except EOFError:
             _safe_print(f"\n{C_GRAY}Bye!{C_RESET}")
             break
         except UnicodeDecodeError:
@@ -1690,33 +1707,35 @@ def run_interactive(
         # Persistent mode loop — fully autonomous
         if _persistent_mode:
             while _persistent_mode:
-                # Auto-continue: check if user typed something (non-blocking), otherwise keep going
+                # Restore terminal before waiting for input
+                if _terminal_saved_state and not _IS_WINDOWS:
+                    try:
+                        current = termios.tcgetattr(sys.stdin)
+                        if current != _terminal_saved_state:
+                            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _terminal_saved_state)
+                    except Exception:
+                        pass
+                _flush_stdin()
+                _drain_stdin()
+
+                # Wait for next instruction — blocking prompt (user controls the pace)
                 try:
-                    import select as _sel
-                    _safe_print(f"\n  {C_GRAY}[persistent] Auto-continuing in 3s... (type 'stop' or Ctrl+C to halt){C_RESET}")
-                    # Wait up to 3 seconds for user input
-                    ready, _, _ = _sel.select([sys.stdin], [], [], 3.0)
-                    if ready:
-                        follow_up = sys.stdin.readline().strip()
-                    else:
-                        follow_up = ""
-                except (EOFError, KeyboardInterrupt):
+                    _safe_print(f"\n  {C_GRAY}[persistent] Waiting for next task... (type 'stop' or Ctrl+C to halt){C_RESET}")
+                    follow_up = input(
+                        f"  {RL_START}{C_GRAY}{RL_END}[persistent]{RL_START}{C_RESET}{RL_END} "
+                        f"{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
+                    ).strip()
+                except KeyboardInterrupt:
                     _persistent_mode = False
                     _safe_print(f"\n  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
                     break
-                except Exception:
-                    # select not available (Windows) — fallback to blocking input
-                    try:
-                        follow_up = input(
-                            f"\n  {RL_START}{C_GRAY}{RL_END}[persistent]{RL_START}{C_RESET}{RL_END} "
-                            f"{RL_START}{C_BOLD}{C_BRIGHT_CYAN}{RL_END}{_PROMPT_CHAR}{RL_START}{C_RESET}{RL_END} "
-                        ).strip()
-                    except (EOFError, KeyboardInterrupt):
-                        _persistent_mode = False
-                        _safe_print(f"\n  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
-                        break
+                except EOFError:
+                    _persistent_mode = False
+                    _safe_print(f"\n  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
+                    break
+
                 if not follow_up:
-                    follow_up = "Continue with the task. If you finished everything, say DONE and summarize what you did."
+                    continue
                 if follow_up.lower() in ("stop", "parar", "detener", "exit", "done"):
                     _persistent_mode = False
                     ops._max_rounds = 25
@@ -1725,6 +1744,7 @@ def run_interactive(
                     max_time = 600
                     _safe_print(f"  {C_BRIGHT_GREEN}✓ Persistent stopped.{C_RESET}")
                     break
+                follow_up = _read_multiline(follow_up)
                 _save_history()
                 process_message(ops, follow_up)
                 _save_session(ops._messages)

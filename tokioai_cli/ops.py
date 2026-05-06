@@ -194,6 +194,21 @@ ROUTER_IP = os.getenv("ROUTER_IP", "")
 # System prompt — TokioAI personality
 # ---------------------------------------------------------------------------
 
+# Load SOUL.md if it exists — persistent context about infrastructure
+_SOUL_CONTEXT = ""
+for _soul_path in [
+    os.path.expanduser("~/.tokioai/SOUL.md"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "SOUL.md"),
+    "SOUL.md",
+]:
+    if os.path.isfile(_soul_path):
+        try:
+            with open(_soul_path, "r") as _f:
+                _SOUL_CONTEXT = "\n\n## Infrastructure Context (from SOUL.md)\n" + _f.read()
+        except Exception:
+            pass
+        break
+
 SYSTEM_PROMPT = """You are TokioAI — specialized in cybersecurity, hacking, engineering, DevOps, and creative problem solving.
 
 You execute commands, fix bugs, deploy infrastructure, audit security, and build solutions. You have full access to the user's terminal.
@@ -231,7 +246,7 @@ You execute commands, fix bugs, deploy infrastructure, audit security, and build
 - When building something: plan → implement → test → deliver.
 - Always mask credentials in output.
 - Use Spanish if the user speaks Spanish, English otherwise.
-- Be creative. Think like a hacker. Find elegant solutions."""
+- Be creative. Think like a hacker. Find elegant solutions.""" + _SOUL_CONTEXT
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1117,7 @@ class TokioOps:
     def _chat_anthropic(self, user_input, on_tool_start, on_tool_end, on_text) -> str:
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
-        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 999999
 
         for turn in range(effective_limit):
             # API call with exponential backoff on retryable errors
@@ -1227,7 +1242,7 @@ class TokioOps:
         """Anthropic chat with streaming — tokens emitted as they arrive."""
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
-        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 999999
 
         for turn in range(effective_limit):
             self._set_state("thinking")
@@ -1394,7 +1409,7 @@ class TokioOps:
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
         openai_tools = _tools_to_openai(TOOLS)
-        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 999999
 
         for turn in range(effective_limit):
             self._set_state("thinking")
@@ -1526,7 +1541,7 @@ class TokioOps:
         self._compact_messages(on_text)
         self._messages.append({"role": "user", "content": user_input})
         openai_tools = _tools_to_openai(TOOLS)
-        effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+        effective_limit = self._max_rounds if self._max_rounds > 0 else 999999
 
         for turn in range(effective_limit):
             stream_obj = None
@@ -1724,7 +1739,7 @@ class TokioOps:
                 max_output_tokens=MAX_TOKENS,
             )
 
-            effective_limit = self._max_rounds if self._max_rounds > 0 else 500
+            effective_limit = self._max_rounds if self._max_rounds > 0 else 999999
             for turn in range(effective_limit):
                 self._set_state("thinking")
                 self._emit("pre_api", provider="gemini", turn=turn)
