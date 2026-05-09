@@ -209,6 +209,63 @@ for _soul_path in [
             pass
         break
 
+# Load persistent memory — survives across sessions
+MEMORY_DIR = os.path.expanduser("~/.tokioai")
+MEMORY_FILE = os.path.join(MEMORY_DIR, "memory.md")
+TASKS_FILE = os.path.join(MEMORY_DIR, "tasks.json")
+
+def _load_memory() -> str:
+    """Load persistent memory file."""
+    if os.path.isfile(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                content = f.read().strip()
+            if content:
+                return content
+        except Exception:
+            pass
+    return ""
+
+def _save_memory(content: str):
+    """Save persistent memory file."""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    with open(MEMORY_FILE, "w") as f:
+        f.write(content)
+
+def _load_tasks() -> list:
+    """Load persistent task list."""
+    if os.path.isfile(TASKS_FILE):
+        try:
+            with open(TASKS_FILE, "r") as f:
+                return json.loads(f.read())
+        except Exception:
+            pass
+    return []
+
+def _save_tasks(tasks: list):
+    """Save persistent task list."""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    with open(TASKS_FILE, "w") as f:
+        f.write(json.dumps(tasks, indent=2, ensure_ascii=False))
+
+def _build_memory_context() -> str:
+    """Build memory + tasks context for system prompt."""
+    parts = []
+    mem = _load_memory()
+    if mem:
+        parts.append(f"\n\n## Persistent Memory (~/.tokioai/memory.md)\n{mem}")
+    tasks = _load_tasks()
+    active = [t for t in tasks if t.get("status") != "done"]
+    if active:
+        lines = []
+        for t in active[-10:]:
+            status = t.get("status", "pending")
+            icon = {"pending": "[ ]", "in_progress": "[~]", "done": "[x]", "blocked": "[!]"}.get(status, "[ ]")
+            lines.append(f"{icon} {t.get('task', '?')} ({status})")
+        parts.append("\n\n## Active Tasks (~/.tokioai/tasks.json)\n" + "\n".join(lines))
+    return "".join(parts)
+
+
 SYSTEM_PROMPT = """You are TokioAI — specialized in cybersecurity, hacking, engineering, DevOps, and creative problem solving.
 
 You execute commands, fix bugs, deploy infrastructure, audit security, and build solutions. You have full access to the user's terminal.
@@ -246,7 +303,26 @@ You execute commands, fix bugs, deploy infrastructure, audit security, and build
 - When building something: plan → implement → test → deliver.
 - Always mask credentials in output.
 - Use Spanish if the user speaks Spanish, English otherwise.
-- Be creative. Think like a hacker. Find elegant solutions.""" + _SOUL_CONTEXT
+- Be creative. Think like a hacker. Find elegant solutions.
+
+## Persistent Memory
+You have persistent memory at ~/.tokioai/memory.md that survives across sessions.
+Use the `memory` tool to read/write/append/clear your memory.
+- When you learn something important about the user's setup, preferences, or ongoing work — save it.
+- When the user says "remember this" or "don't forget" — always save it.
+- When starting a new task, check memory first for relevant context.
+- Keep memory concise: facts, not conversations.
+
+## Task Tracking
+You have a persistent task list at ~/.tokioai/tasks.json.
+Use the `task` tool to add/update/list/remove tasks.
+- When starting work, create a task. Update status as you progress.
+- Tasks persist across sessions so the user can resume later.
+
+## Sensitive Data
+NEVER output raw passwords, API keys, tokens, or private keys.
+Always mask them: show first 4 and last 4 chars with *** in between.
+Example: ghp_LRsA****2QVVMa""" + _SOUL_CONTEXT + _build_memory_context()
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +456,45 @@ TOOLS = [
                 "timeout": {"type": "integer", "description": "Connection timeout in seconds (default: 10)"},
             },
             "required": ["host", "username", "password"],
+        },
+    },
+    {
+        "name": "memory",
+        "description": "Persistent memory that survives across sessions. Use to remember user preferences, project context, ongoing work, learned facts. Actions: read (show all memory), write (overwrite all), append (add a note), clear (erase all).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "read, write, append, or clear",
+                    "enum": ["read", "write", "append", "clear"],
+                },
+                "content": {"type": "string", "description": "Content to write/append (ignored for read/clear)"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "task",
+        "description": "Persistent task tracker across sessions. Use to track what you're working on so the user can resume later. Actions: add (new task), update (change status), list (show all), remove (delete), clear_done (remove completed).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "add, update, list, remove, clear_done",
+                    "enum": ["add", "update", "list", "remove", "clear_done"],
+                },
+                "task": {"type": "string", "description": "Task description (for add)"},
+                "id": {"type": "integer", "description": "Task ID (for update/remove)"},
+                "status": {
+                    "type": "string",
+                    "description": "New status (for update)",
+                    "enum": ["pending", "in_progress", "done", "blocked"],
+                },
+                "note": {"type": "string", "description": "Optional note to add to task"},
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -632,6 +747,76 @@ def execute_tool(name: str, input_data: dict) -> str:
         port = input_data.get("port", 22)
         timeout = input_data.get("timeout", 10)
         return _ssh_password_cmd(host, username, password, command, port, timeout)
+
+    elif name == "memory":
+        action = input_data["action"]
+        content = input_data.get("content", "")
+        if action == "read":
+            mem = _load_memory()
+            return mem if mem else "(memory is empty — use append to add notes)"
+        elif action == "write":
+            _save_memory(content)
+            return f"Memory saved ({len(content)} chars)"
+        elif action == "append":
+            existing = _load_memory()
+            timestamp = time.strftime("%Y-%m-%d")
+            new_entry = f"\n\n## {timestamp}\n{content}" if existing else f"## {timestamp}\n{content}"
+            _save_memory(existing + new_entry)
+            return f"Appended to memory. Total: {len(existing) + len(new_entry)} chars"
+        elif action == "clear":
+            _save_memory("")
+            return "Memory cleared"
+        return "Unknown memory action"
+
+    elif name == "task":
+        action = input_data["action"]
+        tasks = _load_tasks()
+        if action == "add":
+            task_desc = input_data.get("task", "Untitled task")
+            new_id = max([t.get("id", 0) for t in tasks], default=0) + 1
+            tasks.append({
+                "id": new_id,
+                "task": task_desc,
+                "status": "pending",
+                "created": time.strftime("%Y-%m-%d %H:%M"),
+                "notes": [],
+            })
+            _save_tasks(tasks)
+            return f"Task #{new_id} created: {task_desc}"
+        elif action == "update":
+            tid = input_data.get("id", 0)
+            for t in tasks:
+                if t.get("id") == tid:
+                    if "status" in input_data:
+                        t["status"] = input_data["status"]
+                    if input_data.get("note"):
+                        t.setdefault("notes", []).append(input_data["note"])
+                    t["updated"] = time.strftime("%Y-%m-%d %H:%M")
+                    _save_tasks(tasks)
+                    return f"Task #{tid} updated: {t['status']}"
+            return f"Task #{tid} not found"
+        elif action == "list":
+            if not tasks:
+                return "No tasks."
+            lines = []
+            for t in tasks:
+                status = t.get("status", "pending")
+                icon = {"pending": "[ ]", "in_progress": "[~]", "done": "[x]", "blocked": "[!]"}.get(status, "[ ]")
+                lines.append(f"{icon} #{t['id']} {t['task']} ({status})")
+                for n in t.get("notes", []):
+                    lines.append(f"     → {n}")
+            return "\n".join(lines)
+        elif action == "remove":
+            tid = input_data.get("id", 0)
+            tasks = [t for t in tasks if t.get("id") != tid]
+            _save_tasks(tasks)
+            return f"Task #{tid} removed"
+        elif action == "clear_done":
+            before = len(tasks)
+            tasks = [t for t in tasks if t.get("status") != "done"]
+            _save_tasks(tasks)
+            return f"Cleared {before - len(tasks)} completed tasks"
+        return "Unknown task action"
 
     return f"ERROR: Unknown tool '{name}'"
 

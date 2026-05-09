@@ -288,7 +288,7 @@ COST_FILE = os.path.expanduser("~/.tokioai_costs.json")
 
 _CLI_COMMANDS = [
     "exit", "quit", "help", "reset", "compact", "stats", "model", "models", "clear",
-    "unlimited", "persistent", "stop", "config",
+    "unlimited", "persistent", "stop", "config", "memory", "tasks",
     "/status", "/waf", "/health", "/drone", "/threats", "/entity",
     "/sitrep", "/see", "/containers", "/wifi", "/coffee", "/logs", "/ha", "/picar",
     "/gcp", "/diff", "/commit", "/branch",
@@ -575,12 +575,24 @@ class MarkdownRenderer:
 # ═══════════════════════════════════════════════════════
 
 _SENSITIVE_PATTERNS = [
+    # API keys & tokens
     (re.compile(r'github_pat_[A-Za-z0-9_]{20,}'), '[GITHUB_TOKEN]'),
     (re.compile(r'ghp_[A-Za-z0-9]{36,}'), '[GITHUB_TOKEN]'),
+    (re.compile(r'gho_[A-Za-z0-9]{36,}'), '[GITHUB_TOKEN]'),
     (re.compile(r'sk-ant-[A-Za-z0-9_-]{20,}'), '[ANTHROPIC_KEY]'),
     (re.compile(r'sk-[A-Za-z0-9]{20,}'), '[API_KEY]'),
     (re.compile(r'AIza[A-Za-z0-9_-]{35}'), '[GOOGLE_API_KEY]'),
     (re.compile(r'AKIA[A-Z0-9]{16}'), '[AWS_KEY]'),
+    (re.compile(r'xoxb-[A-Za-z0-9\-]{20,}'), '[SLACK_TOKEN]'),
+    (re.compile(r'xoxp-[A-Za-z0-9\-]{20,}'), '[SLACK_TOKEN]'),
+    # Bearer tokens
+    (re.compile(r'(Bearer\s+)[A-Za-z0-9_\-\.]{20,}'), r'\1[TOKEN]'),
+    # JWT tokens (header.payload.signature)
+    (re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_\-]{10,}'), '[JWT_TOKEN]'),
+    # Generic long hex/base64 secrets (env var assignments like KEY=abc123...)
+    (re.compile(r'((?:PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|AUTH)\s*[=:]\s*)[^\s]{12,}', re.IGNORECASE), r'\1[REDACTED]'),
+    # SSH private key content
+    (re.compile(r'-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----'), '[PRIVATE_KEY]'),
 ]
 
 def _mask_sensitive(text: str) -> str:
@@ -1457,6 +1469,21 @@ def run_interactive(
             _safe_print(f"  {C_BRIGHT_GREEN}✓ Session restored{C_RESET}")
         else:
             _safe_print(f"  {C_GRAY}New session.{C_RESET}")
+
+    # Show active tasks and memory status on startup
+    from .ops import _load_tasks, _load_memory
+    active_tasks = [t for t in _load_tasks() if t.get("status") != "done"]
+    mem_size = len(_load_memory())
+    if active_tasks or mem_size:
+        _safe_print()
+        if mem_size:
+            _safe_print(f"  {C_GRAY}📝 Memory: {mem_size} chars loaded{C_RESET}")
+        if active_tasks:
+            _safe_print(f"  {C_GRAY}📋 Active tasks:{C_RESET}")
+            for t in active_tasks[-5:]:
+                status = t.get("status", "pending")
+                icon = {"pending": "○", "in_progress": "◉", "blocked": "⊘"}.get(status, "○")
+                _safe_print(f"    {C_GRAY}{icon} #{t['id']} {t['task'][:60]} ({status}){C_RESET}")
 
     _safe_print()
 
