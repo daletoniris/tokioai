@@ -479,6 +479,7 @@ class CostTracker:
 
 
 _cost_tracker = CostTracker()
+_HIDE_COST = os.getenv("TOKIOAI_HIDE_COST", "").lower() in ("1", "true", "yes")
 
 
 # ═══════════════════════════════════════════════════════
@@ -1364,8 +1365,9 @@ def process_message(ops: TokioOps, user_input: str):
     ops._last_tracked_output = output_t
     if delta_in > 0 or delta_out > 0:
         _cost_tracker.add_usage(ops.model, delta_in, delta_out)
-        this_cost = _cost_tracker.estimate_single(ops.model, delta_in, delta_out)
-        parts.append(f"{_ICON_COST} ~{this_cost} (session: {_cost_tracker.format_cost()})")
+        if not _HIDE_COST:
+            this_cost = _cost_tracker.estimate_single(ops.model, delta_in, delta_out)
+            parts.append(f"{_ICON_COST} ~{this_cost} (session: {_cost_tracker.format_cost()})")
 
     _safe_print(f"\n  {C_GRAY}{f' {_BOX_V} '.join(parts)}{C_RESET}")
 
@@ -1585,12 +1587,13 @@ def run_interactive(
             est = ops._estimate_tokens() if hasattr(ops, '_estimate_tokens') else 0
             _safe_print(f"  Messages:  {len(ops._messages)} (~{est:,} tokens, compacted {ops._compaction_count}x)")
             _safe_print(f"  Tokens:    {ops.token_usage_str}")
-            _safe_print(f"  Cost:      {_cost_tracker.format_cost()}")
-            if _cost_tracker.model_usage:
-                _safe_print(f"\n  {C_BOLD}Per model:{C_RESET}")
-                for m, u in _cost_tracker.model_usage.items():
-                    c = f"${u['cost']:.4f}" if u['cost'] < 0.01 else f"${u['cost']:.2f}"
-                    _safe_print(f"    {m}: {u['input']:,}in/{u['output']:,}out = {c}")
+            if not _HIDE_COST:
+                _safe_print(f"  Cost:      {_cost_tracker.format_cost()}")
+                if _cost_tracker.model_usage:
+                    _safe_print(f"\n  {C_BOLD}Per model:{C_RESET}")
+                    for m, u in _cost_tracker.model_usage.items():
+                        c = f"${u['cost']:.4f}" if u['cost'] < 0.01 else f"${u['cost']:.2f}"
+                        _safe_print(f"    {m}: {u['input']:,}in/{u['output']:,}out = {c}")
             _safe_print(f"  {C_BOLD}{C_BRIGHT_CYAN}{_LINE_THIN * w}{C_RESET}\n")
             continue
 
