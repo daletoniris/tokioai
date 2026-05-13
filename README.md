@@ -26,7 +26,7 @@ No copy-pasting commands. No "here's what you should do". It **does it**.
 
 ## What it actually does
 
-TokioAI gives AI models 15 tools to interact with your world:
+TokioAI gives AI models 16 tools to interact with your world:
 
 | Tool | What it does |
 |------|-------------|
@@ -45,6 +45,7 @@ TokioAI gives AI models 15 tools to interact with your world:
 | `pidog` | Control a PiDog robot via HTTP API |
 | `picar` | Control a PiCar-X robot via HTTP API |
 | `home_assistant` | Control smart home via Home Assistant (lights, Alexa, sensors, switches) |
+| `drone` | Control a Tello drone via safety proxy (takeoff, land, move, snapshot, geofence) |
 
 These aren't gimmicks. They use **native function calling** — the same tool-use protocol built into Claude, GPT, and Gemini's APIs. The model decides what tool to call, with what arguments, inspects the result, and decides the next step. Multiple rounds. No regex parsing. No prompt hacking.
 
@@ -380,6 +381,42 @@ If `HA_URL` and `HA_TOKEN` are not set, the tool simply isn't available — no e
 
 ---
 
+## Drone control
+
+TokioAI can fly a [DJI Tello](https://www.ryzerobotics.com/tello) drone through a safety proxy that enforces geofence limits, battery checks, and emergency kill switches.
+
+Configure in `~/.tokioai/.env`:
+
+```bash
+DRONE_URL=http://192.168.1.100:5001
+```
+
+The safety proxy runs on a Raspberry Pi connected to the drone's WiFi and provides:
+
+- **Geofence** — max height, distance, and speed limits
+- **Battery protection** — refuses to fly below 25%
+- **Kill switch** — emergency motor cutoff
+- **Audit log** — every command is logged
+- **Camera snapshots** — take photos from the drone
+
+```
+you > "connect to the drone, take off, go up 50cm, take a photo, and land"
+
+TokioAI:
+  [drone] wifi_status — checking connection
+  [drone] connect: TELLO-ABC123
+  [drone] status — battery 87%, geofence OK
+  [drone] command: takeoff
+  [drone] command: up 50
+  [drone] snapshot
+  [drone] command: land
+
+  Done! Took off, went up 50cm, captured a snapshot, and landed safely.
+  Battery remaining: 82%.
+```
+
+---
+
 ## Context management
 
 Long sessions don't lose context. TokioAI tracks token usage per model and auto-compacts old messages when the context window fills up. The important stuff stays — the noise gets summarized.
@@ -435,6 +472,12 @@ All configuration goes in `~/.tokioai/.env`. See `.env.example` for a full templ
 |----------|-------------|
 | `PIDOG_URL` | PiDog robot proxy URL (e.g., `http://192.168.1.50:5001`) |
 | `PICAR_URL` | PiCar-X robot proxy URL (e.g., `http://192.168.1.51:5002`) |
+
+### Drone (optional)
+
+| Variable | Description |
+|----------|-------------|
+| `DRONE_URL` | Drone safety proxy URL (e.g., `http://192.168.1.100:5001`) |
 
 ### Home Assistant (optional)
 

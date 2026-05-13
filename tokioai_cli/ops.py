@@ -672,12 +672,41 @@ TOOLS = [
             "required": ["action"],
         },
     },
+    {
+        "name": "drone",
+        "description": (
+            "Control a Tello drone via safety proxy. Configure DRONE_URL in .env. Actions:\n"
+            "- status: Get drone status (battery, position, connection, geofence, safety level)\n"
+            "- connect: Connect to drone WiFi. Params: ssid (e.g. TELLO-XXXXX)\n"
+            "- disconnect: Disconnect from drone WiFi\n"
+            "- wifi_status: Check WiFi connection status\n"
+            "- command: Send a drone command. Params: cmd (takeoff, land, up/down/left/right/forward/back + distance, "
+            "cw/ccw + degrees, flip, battery?, speed?), speed (optional)\n"
+            "  IMPORTANT: Always check status first. Never fly without confirming battery > 25%.\n"
+            "- kill: Emergency stop — cuts motors immediately\n"
+            "- kill_reset: Reset kill switch after emergency stop\n"
+            "- snapshot: Take a photo from the drone camera\n"
+            "- geofence: View current geofence settings (max height, distance, speed)\n"
+            "- audit: View command audit log\n"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action: status, connect, disconnect, wifi_status, command, kill, kill_reset, snapshot, geofence, audit"},
+                "cmd": {"type": "string", "description": "Drone command for 'command' action (e.g. takeoff, land, up 50, forward 100, cw 90)"},
+                "speed": {"type": "integer", "description": "Speed for movement commands (10-100)"},
+                "ssid": {"type": "string", "description": "Drone WiFi SSID for 'connect' action (e.g. TELLO-XXXXX)"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
 
 
 # Robot proxy configuration
 PIDOG_URL = os.getenv("PIDOG_URL", "")
 PICAR_URL = os.getenv("PICAR_URL", "")
+DRONE_URL = os.getenv("DRONE_URL", "")
 ROBOT_TIMEOUT = 15
 
 
@@ -1008,6 +1037,9 @@ def execute_tool(name: str, input_data: dict) -> str:
     elif name == "home_assistant":
         return _ha_execute(input_data)
 
+    elif name == "drone":
+        return _drone_execute(input_data)
+
     return f"ERROR: Unknown tool '{name}'"
 
 
@@ -1257,6 +1289,65 @@ def _ha_check_playing(entity_id: str) -> str:
         now = f" ({title}" + (f" - {artist})" if artist else ")") if title else ""
         return f"Playing on {entity_id}{now}"
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Drone integration
+# ---------------------------------------------------------------------------
+
+def _drone_execute(input_data: dict) -> str:
+    """Execute a drone action via the safety proxy."""
+    if not DRONE_URL:
+        return "Drone not configured. Set DRONE_URL in ~/.tokioai/.env (e.g. http://192.168.1.100:5001)"
+    import urllib.request
+    import urllib.error
+
+    action = input_data.get("action", "status")
+    base = DRONE_URL.rstrip("/")
+    timeout = 20
+
+    action_map = {
+        "status":      ("GET",  "/drone/status",          None),
+        "connect":     ("POST", "/drone/wifi/connect",     {"ssid": input_data.get("ssid", "")}),
+        "disconnect":  ("POST", "/drone/wifi/disconnect",  {}),
+        "wifi_status": ("GET",  "/drone/wifi/status",      None),
+        "command":     ("POST", "/drone/command",          {"command": input_data.get("cmd", ""), "speed": input_data.get("speed")}),
+        "kill":        ("POST", "/drone/kill",             {}),
+        "kill_reset":  ("POST", "/drone/kill/reset",       {}),
+        "snapshot":    ("POST", "/drone/snapshot",         {}),
+        "geofence":    ("GET",  "/drone/geofence",         None),
+        "audit":       ("GET",  "/drone/audit",            None),
+    }
+
+    if action not in action_map:
+        return f"ERROR: Unknown drone action '{action}'. Available: {', '.join(action_map.keys())}"
+
+    method, path, payload = action_map[action]
+    url = f"{base}{path}"
+
+    try:
+        if method == "GET":
+            req = urllib.request.Request(url)
+        else:
+            # Clean None values from payload
+            if payload:
+                payload = {k: v for k, v in payload.items() if v is not None}
+            body = json.dumps(payload or {}).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.dumps(json.loads(data), indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            return data[:8000]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:400] if e.fp else ""
+        return f"ERROR: HTTP {e.code}: {body}"
+    except urllib.error.URLError as e:
+        return f"ERROR: Drone proxy not reachable ({url}): {e.reason}"
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
 # ---------------------------------------------------------------------------
