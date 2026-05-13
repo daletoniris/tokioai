@@ -214,6 +214,60 @@ MEMORY_DIR = os.path.expanduser("~/.tokioai")
 MEMORY_FILE = os.path.join(MEMORY_DIR, "memory.md")
 TASKS_FILE = os.path.join(MEMORY_DIR, "tasks.json")
 
+# TokioAI Agent API — for shared memory sync across machines.
+# Users running their own TokioAI agent can set TOKIO_AGENT_URL to sync
+# memory across multiple CLI installations (e.g. different PCs).
+# Leave empty to use local-only memory (default for open source users).
+TOKIO_AGENT_URL = os.getenv("TOKIO_AGENT_URL", "")
+
+def _sync_memory_from_agent():
+    """Download shared memory from TokioAI agent and merge with local."""
+    if not TOKIO_AGENT_URL:
+        return
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{TOKIO_AGENT_URL}/memory", method="GET")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        remote = data.get("memory", "").strip()
+        if not remote:
+            return
+        local = ""
+        if os.path.isfile(MEMORY_FILE):
+            with open(MEMORY_FILE, "r") as f:
+                local = f.read().strip()
+        if not local:
+            # No local memory — use remote entirely
+            os.makedirs(MEMORY_DIR, exist_ok=True)
+            with open(MEMORY_FILE, "w") as f:
+                f.write(remote)
+            return
+        # Merge: if remote has lines not in local, append them
+        local_lines = set(local.splitlines())
+        new_lines = [l for l in remote.splitlines() if l.strip() and l not in local_lines]
+        if new_lines:
+            with open(MEMORY_FILE, "a") as f:
+                f.write("\n\n## [Synced from TokioAI Agent]\n")
+                f.write("\n".join(new_lines))
+    except Exception:
+        pass  # silently skip if agent unreachable
+
+
+def _push_memory_to_agent(content: str):
+    """Upload local memory to TokioAI agent for sharing across machines."""
+    if not TOKIO_AGENT_URL:
+        return
+    try:
+        import urllib.request
+        payload = json.dumps({"memory": content}).encode()
+        req = urllib.request.Request(f"{TOKIO_AGENT_URL}/memory", data=payload, method="POST")
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # silently skip if agent unreachable
+
+
 def _load_memory() -> str:
     """Load persistent memory file."""
     if os.path.isfile(MEMORY_FILE):
@@ -227,10 +281,11 @@ def _load_memory() -> str:
     return ""
 
 def _save_memory(content: str):
-    """Save persistent memory file."""
+    """Save persistent memory file and sync to agent."""
     os.makedirs(MEMORY_DIR, exist_ok=True)
     with open(MEMORY_FILE, "w") as f:
         f.write(content)
+    _push_memory_to_agent(content)
 
 def _load_tasks() -> list:
     """Load persistent task list."""
@@ -266,7 +321,7 @@ def _build_memory_context() -> str:
     return "".join(parts)
 
 
-SYSTEM_PROMPT = """You are TokioAI — specialized in cybersecurity, hacking, engineering, DevOps, and creative problem solving.
+_SYSTEM_PROMPT_BASE = """You are TokioAI — specialized in cybersecurity, hacking, engineering, DevOps, and creative problem solving.
 
 You execute commands, fix bugs, deploy infrastructure, audit security, and build solutions. You have full access to the user's terminal.
 
@@ -312,6 +367,7 @@ Use the `memory` tool to read/write/append/clear your memory.
 - When the user says "remember this" or "don't forget" — always save it.
 - When starting a new task, check memory first for relevant context.
 - Keep memory concise: facts, not conversations.
+- IMPORTANT: At the START of every new conversation, ALWAYS read your memory first to load context.
 
 ## Task Tracking
 You have a persistent task list at ~/.tokioai/tasks.json.
@@ -322,7 +378,19 @@ Use the `task` tool to add/update/list/remove tasks.
 ## Sensitive Data
 NEVER output raw passwords, API keys, tokens, or private keys.
 Always mask them: show first 4 and last 4 chars with *** in between.
-Example: ghp_LRsA****2QVVMa""" + _SOUL_CONTEXT + _build_memory_context()
+Example: ghp_LRsA****2QVVMa"""
+
+
+def _get_system_prompt() -> str:
+    """Build system prompt dynamically — reloads memory and tasks every call."""
+    return _SYSTEM_PROMPT_BASE + _SOUL_CONTEXT + _build_memory_context()
+
+
+# Sync memory from TokioAI agent at startup (non-blocking, silent on failure)
+_sync_memory_from_agent()
+
+# Keep backward compat for any external references
+SYSTEM_PROMPT = _get_system_prompt()
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +565,37 @@ TOOLS = [
             "required": ["action"],
         },
     },
+    {
+        "name": "pidog",
+        "description": "Control PiDog robot via HTTP proxy. Actions: status, sensors, do_action (name: stand/sit/forward/backward/etc, steps), preset (name: bark/howling/hand_shake/high_five), speak (name: single_bark_1/howling/angry), wake_up, patrol, stop_patrol, interactive, stop_interactive, head (yaw/roll/pitch), tail (angle), rgb (mode/color), stop, snapshot. Configure PIDOG_URL in .env.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action to perform"},
+                "params": {"type": "object", "description": "Parameters for the action"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "picar",
+        "description": "Control PiCar-X robot via HTTP proxy. Actions: status, sensors, move (direction/speed/duration/angle), camera (pan/tilt), look (direction: center/left/right/up/down), steer (angle), obstacle_avoid (duration/speed), line_track, patrol (pattern/duration/speed), dance, stop, kill, snapshot. Configure PICAR_URL in .env.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action to perform"},
+                "params": {"type": "object", "description": "Parameters for the action"},
+            },
+            "required": ["action"],
+        },
+    },
 ]
+
+
+# Robot proxy configuration
+PIDOG_URL = os.getenv("PIDOG_URL", "")
+PICAR_URL = os.getenv("PICAR_URL", "")
+ROBOT_TIMEOUT = 15
 
 
 # ---------------------------------------------------------------------------
@@ -818,7 +916,71 @@ def execute_tool(name: str, input_data: dict) -> str:
             return f"Cleared {before - len(tasks)} completed tasks"
         return "Unknown task action"
 
+    elif name in ("pidog", "picar"):
+        action = input_data.get("action", "status")
+        params = input_data.get("params", {})
+        base_url = PIDOG_URL if name == "pidog" else PICAR_URL
+        return _robot_request(base_url, action, params)
+
     return f"ERROR: Unknown tool '{name}'"
+
+
+def _robot_request(base_url: str, action: str, params: dict = None) -> str:
+    """Send HTTP request to a robot proxy (PiDog or PiCar-X)."""
+    if not base_url:
+        return "Robot not configured. Set PIDOG_URL or PICAR_URL in ~/.tokioai/.env"
+    import urllib.request
+    import urllib.error
+
+    # Action -> endpoint mapping
+    get_actions = {"status", "sensors", "sounds", "actions", "snapshot"}
+    timeout = ROBOT_TIMEOUT
+
+    if action in get_actions:
+        path = f"/{action}"
+        url = f"{base_url}{path}"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.dumps(json.loads(data), indent=2, ensure_ascii=False)
+            except json.JSONDecodeError:
+                return data[:8000]
+        except urllib.error.URLError as e:
+            return f"ERROR: Robot no responde ({url}): {e.reason}"
+        except Exception as e:
+            return f"ERROR: {e}"
+    else:
+        # POST actions
+        path_map = {
+            "do_action": "/action", "preset": "/preset", "speak": "/speak",
+            "wake_up": "/wake_up", "patrol": "/patrol", "stop_patrol": "/stop_patrol",
+            "interactive": "/interactive", "stop_interactive": "/stop_interactive",
+            "head": "/head", "tail": "/tail", "rgb": "/rgb", "stop": "/stop",
+            # PiCar specific
+            "move": "/move", "camera": "/camera", "look": "/camera/look",
+            "steer": "/steer", "obstacle_avoid": "/obstacle_avoid",
+            "line_track": "/line_track", "dance": "/dance",
+            "servo_test": "/servo_test", "motor_test": "/motor_test",
+            "calibrate": "/calibrate", "init": "/init", "kill": "/kill",
+        }
+        path = path_map.get(action, f"/{action}")
+        url = f"{base_url}{path}"
+        body = json.dumps(params or {}).encode('utf-8')
+        try:
+            req = urllib.request.Request(url, data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=max(timeout, 20)) as resp:
+                data = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.dumps(json.loads(data), indent=2, ensure_ascii=False)
+            except json.JSONDecodeError:
+                return data[:8000]
+        except urllib.error.URLError as e:
+            return f"ERROR: Robot no responde ({url}): {e.reason}"
+        except Exception as e:
+            return f"ERROR: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -1265,10 +1427,16 @@ class TokioOps:
         if not summary:
             summary = digest[:3000]
 
+        # Inject persistent memory into the summary so it's never lost
+        mem_context = _build_memory_context()
+        summary_with_memory = f"[Previous conversation summary]\n{summary}"
+        if mem_context:
+            summary_with_memory += f"\n\n[Persistent memory — always available]{mem_context}"
+
         # Replace old messages with the summary
         self._messages = [
-            {"role": "user", "content": f"[Previous conversation summary]\n{summary}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. Let's continue."},
+            {"role": "user", "content": summary_with_memory},
+            {"role": "assistant", "content": "Understood. I have the context from our previous conversation and persistent memory. Let's continue."},
         ] + recent_msgs
 
         self._compaction_count += 1
@@ -1312,7 +1480,7 @@ class TokioOps:
                     response = self._client.messages.create(
                         model=self._model,
                         max_tokens=MAX_TOKENS,
-                        system=SYSTEM_PROMPT,
+                        system=_get_system_prompt(),
                         tools=TOOLS,
                         messages=self._messages,
                         timeout=120.0,
@@ -1439,7 +1607,7 @@ class TokioOps:
                     stream_obj = self._client.messages.create(
                         model=self._model,
                         max_tokens=MAX_TOKENS,
-                        system=SYSTEM_PROMPT,
+                        system=_get_system_prompt(),
                         tools=TOOLS,
                         messages=self._messages,
                         timeout=120.0,
@@ -1603,7 +1771,7 @@ class TokioOps:
             response = None
             for attempt in range(MAX_API_RETRIES + 1):
                 try:
-                    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self._messages
+                    msgs = [{"role": "system", "content": _get_system_prompt()}] + self._messages
                     response = self._client.chat.completions.create(
                         model=self._model,
                         messages=msgs,
@@ -1732,7 +1900,7 @@ class TokioOps:
             stream_obj = None
             for attempt in range(MAX_API_RETRIES + 1):
                 try:
-                    msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + self._messages
+                    msgs = [{"role": "system", "content": _get_system_prompt()}] + self._messages
                     stream_obj = self._client.chat.completions.create(
                         model=self._model,
                         messages=msgs,
@@ -1919,7 +2087,7 @@ class TokioOps:
             contents = list(self._gemini_history)
 
             config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=_get_system_prompt(),
                 tools=gemini_tools,
                 max_output_tokens=MAX_TOKENS,
             )

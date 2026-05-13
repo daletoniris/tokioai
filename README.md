@@ -5,7 +5,7 @@
 TokioAI connects to Claude, GPT, Gemini, Ollama, or any model you want — and gives it **real tools** to interact with your systems. Not wrappers. Not plugins. Native tool calling through each provider's API, the same mechanism the models were trained to use.
 
 ```
-you → "find why nginx is returning 502 and fix it"
+you > "find why nginx is returning 502 and fix it"
 
 TokioAI:
   [execute_local] systemctl status nginx
@@ -26,7 +26,7 @@ No copy-pasting commands. No "here's what you should do". It **does it**.
 
 ## What it actually does
 
-TokioAI gives AI models 10 tools to interact with your world:
+TokioAI gives AI models 14 tools to interact with your world:
 
 | Tool | What it does |
 |------|-------------|
@@ -40,6 +40,10 @@ TokioAI gives AI models 10 tools to interact with your world:
 | `edit_file` | Surgical find-and-replace in files |
 | `search_files` | grep across your codebase |
 | `diagnose` | System health check (CPU, RAM, disk, network, Docker) |
+| `memory` | Read/write persistent memory that survives across sessions |
+| `tasks` | Track tasks with status (pending, in_progress, done, blocked) |
+| `pidog` | Control a PiDog robot via HTTP API |
+| `picar` | Control a PiCar-X robot via HTTP API |
 
 These aren't gimmicks. They use **native function calling** — the same tool-use protocol built into Claude, GPT, and Gemini's APIs. The model decides what tool to call, with what arguments, inspects the result, and decides the next step. Multiple rounds. No regex parsing. No prompt hacking.
 
@@ -71,6 +75,13 @@ These aren't gimmicks. They use **native function calling** — the same tool-us
 "SSH into the prod server and check why disk is at 95%"
 "configure the Raspberry Pi as a network monitor"
 "set up Tailscale between all my machines"
+```
+
+**Robotics:**
+```
+"make the PiDog bark and do a pushup"
+"move PiCar forward 3 steps and take a photo"
+"check battery and sensor status on both robots"
 ```
 
 TokioAI doesn't care what you throw at it. If it can be done from a terminal, it can do it.
@@ -116,11 +127,11 @@ Switch providers and models whenever you want. Same tools, same interface, diffe
 
 Switch at runtime:
 ```
-model opus       ← Claude Opus 4.6
-model flash      ← Gemini Flash (fast + cheap)
-model gpt4o      ← GPT-4o
-model llama      ← Local Llama 3.1 via Ollama
-model deepseek   ← DeepSeek Coder
+model opus       <- Claude Opus 4.6
+model flash      <- Gemini Flash (fast + cheap)
+model gpt4o      <- GPT-4o
+model llama      <- Local Llama 3.1 via Ollama
+model deepseek   <- DeepSeek Coder
 ```
 
 ---
@@ -205,6 +216,67 @@ tokioai --unlimited
 
 ---
 
+## Persistent memory
+
+TokioAI remembers things across sessions. The AI can store facts, infrastructure details, preferences, and task context in a local memory file (`~/.tokioai/memory.md`) that gets loaded into every conversation.
+
+```
+you > "remember that the prod database is on port 5433, not the default"
+
+TokioAI:
+  [memory] append: "Prod database runs on port 5433 (non-standard)"
+
+  Got it. I'll remember that for future sessions.
+```
+
+Next session:
+```
+you > "connect to the prod database and check replication lag"
+
+TokioAI:
+  [execute_local] psql -h prod-db -p 5433 -U ...   <- remembered the port
+
+  Replication lag is 0.3s, within normal range.
+```
+
+Memory is managed via the `memory` tool:
+- **read** — show all stored memory
+- **append** — add a new fact
+- **write** — replace entire memory
+- **clear** — wipe memory
+
+The AI also tracks tasks with the `tasks` tool:
+- **list** — show pending/active tasks
+- **add** — create a new task
+- **update** — change status (pending, in_progress, done, blocked)
+- **clear_done** — remove completed tasks
+
+### Memory sync across machines
+
+If you run TokioAI on multiple computers and want them to share memory, you can connect them to a central TokioAI Agent server:
+
+```bash
+# In ~/.tokioai/.env
+TOKIO_AGENT_URL=http://your-server:8001
+```
+
+When this is set:
+- **On startup**, the CLI downloads shared memory from the agent and merges it with local memory
+- **When saving**, the CLI uploads memory to the agent so other machines can access it
+- If the agent is unreachable, the CLI continues with local memory — no errors, no blocking
+
+When `TOKIO_AGENT_URL` is not set (the default), memory is fully local. No network calls, no external dependencies.
+
+**Setting up the agent server:**
+
+The TokioAI Agent exposes a simple REST API:
+- `GET /memory` — returns the shared memory content
+- `POST /memory` — updates shared memory (JSON body: `{"memory": "content here"}`)
+
+Any HTTP server that implements these two endpoints works. You can use the full TokioAI Agent (Docker) or build your own.
+
+---
+
 ## Remote access
 
 TokioAI can SSH into your machines and operate on them directly. Configure in `~/.tokioai/.env`:
@@ -230,37 +302,184 @@ For password-based SSH: `pip install paramiko`
 
 ---
 
+## Robot control
+
+TokioAI can control robots over HTTP. Currently supported:
+
+| Robot | What it is | Tool |
+|-------|-----------|------|
+| **PiDog** | SunFounder quadruped robot (Raspberry Pi) | `pidog` |
+| **PiCar-X** | SunFounder autonomous car (Raspberry Pi) | `picar` |
+
+Configure the robot URLs in `~/.tokioai/.env`:
+
+```bash
+PIDOG_URL=http://192.168.1.50:5001
+PICAR_URL=http://192.168.1.51:5002
+```
+
+Each robot runs a small HTTP proxy on its Raspberry Pi that translates REST calls into hardware commands. The AI can:
+
+- **Query status** — battery, sensors, IMU, distance
+- **Move** — walk, turn, drive, steer
+- **Actions** — bark, pushup, sit, stretch, wag tail (PiDog)
+- **Speak** — play sounds through the robot's speaker
+- **Take photos** — capture snapshots from the robot's camera
+
+```
+you > "make PiDog bark twice then do a pushup"
+
+TokioAI:
+  [pidog] speak: bark
+  [pidog] speak: bark
+  [pidog] do_action: pushup
+
+  Done! PiDog barked twice and did a pushup.
+```
+
+The robots work alongside all other tools — you can combine robot control with SSH, file editing, diagnostics, and anything else in a single conversation.
+
+---
+
 ## Context management
 
 Long sessions don't lose context. TokioAI tracks token usage per model and auto-compacts old messages when the context window fills up. The important stuff stays — the noise gets summarized.
 
+When auto-compaction runs, persistent memory is injected into the summary so the AI never forgets your infrastructure details, preferences, or active tasks — even after context compression.
+
 ```
-stats          ← see token usage and cost
-compact        ← manually compress context
+stats          <- see token usage and cost
+compact        <- manually compress context
 ```
 
-Sessions persist to disk and can be resumed across restarts.
+Sessions persist to disk (`~/.tokioai_session.json`) and resume automatically on restart (within 7 days).
+
+---
+
+## Configuration reference
+
+All configuration goes in `~/.tokioai/.env`. See `.env.example` for a full template.
+
+### Provider settings
+
+| Variable | Description |
+|----------|-------------|
+| `TOKIOAI_PROVIDER` | Active provider: `anthropic`, `anthropic-vertex`, `openai`, `gemini`, `gemini-vertex`, `openrouter`, `ollama` |
+| `TOKIOAI_MODEL` | Default model (e.g., `opus`, `sonnet`, `flash`, `gpt4o`) |
+
+### API keys (one per provider)
+
+| Variable | Provider |
+|----------|----------|
+| `ANTHROPIC_API_KEY` | Claude (Anthropic API) |
+| `VERTEX_PROJECT` | Claude (Vertex AI) — also needs `GOOGLE_APPLICATION_CREDENTIALS` |
+| `OPENAI_API_KEY` | OpenAI |
+| `GEMINI_API_KEY` | Google Gemini |
+| `OPENROUTER_API_KEY` | OpenRouter |
+| `OLLAMA_HOST` | Ollama (default: `http://localhost:11434`) |
+
+### SSH hosts (optional)
+
+| Variable | Description |
+|----------|-------------|
+| `RASPI_IP` | Raspberry Pi IP address |
+| `RASPI_SSH_USER` | SSH user for the Pi |
+| `SSH_KEY_RASPI` | Path to SSH key for Pi |
+| `GCP_SSH_HOST` | Cloud VM IP address |
+| `GCP_SSH_USER` | SSH user for the VM |
+| `SSH_KEY_GCP` | Path to SSH key for VM |
+| `ROUTER_IP` | Router IP address |
+
+### Robots (optional)
+
+| Variable | Description |
+|----------|-------------|
+| `PIDOG_URL` | PiDog robot proxy URL (e.g., `http://192.168.1.50:5001`) |
+| `PICAR_URL` | PiCar-X robot proxy URL (e.g., `http://192.168.1.51:5002`) |
+
+### Memory sync (optional)
+
+| Variable | Description |
+|----------|-------------|
+| `TOKIO_AGENT_URL` | TokioAI Agent URL for shared memory across machines |
+
+### Other
+
+| Variable | Description |
+|----------|-------------|
+| `MAX_TOKENS` | Max tokens per response (default: `16384`) |
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   You       │────▶│    TokioAI       │────▶│   AI Provider   │
-│  (terminal) │     │  (tool executor)  │     │ Claude/GPT/etc  │
-└─────────────┘     └──────┬───────────┘     └────────┬────────┘
-                           │                          │
-                    ┌──────▼───────────┐    structured tool calls
-                    │   Your systems   │◀─────────────┘
-                    │  servers, files,  │
-                    │  network, docker  │
-                    └──────────────────┘
++-----------+     +----------------+     +---------------+
+|   You     |---->|    TokioAI     |---->|  AI Provider  |
+| (terminal)|     | (tool executor)|     | Claude/GPT/...|
++-----------+     +------+---------+     +------+--------+
+                         |                      |
+                  +------v---------+   structured tool calls
+                  |  Your systems  |<-----------+
+                  | servers, files,|
+                  | network, robots|
+                  +----------------+
 ```
 
 TokioAI is the bridge between the model's intelligence and your infrastructure. The model thinks, TokioAI acts.
 
-~1300 lines of Python. No frameworks. No dependencies beyond the provider SDKs. Runs on Linux, macOS, and Windows.
+~2000 lines of Python. No frameworks. No dependencies beyond the provider SDKs. Runs on Linux, macOS, and Windows.
+
+---
+
+## File structure
+
+```
+tokioai/
+  tokioai_cli/
+    __init__.py          # Package init
+    __main__.py          # Entry point (python -m tokioai_cli)
+    ops.py               # Engine: providers, tools, memory, compaction
+    interactive.py       # Interactive REPL with readline, streaming, sessions
+  pyproject.toml         # Package config + dependencies
+  .env.example           # Configuration template
+  README.md              # This file
+```
+
+Local data (created on first run):
+```
+~/.tokioai/
+  .env                   # Your configuration
+  memory.md              # Persistent memory
+  tasks.json             # Task tracking
+  SOUL.md                # Optional: infrastructure context loaded into every session
+~/.tokioai_session.json  # Session state (auto-resume)
+```
+
+---
+
+## SOUL.md — infrastructure context
+
+If you create `~/.tokioai/SOUL.md`, its contents are loaded into every conversation as permanent context. Use it to describe your infrastructure so TokioAI always knows your setup:
+
+```markdown
+# My Infrastructure
+
+## Servers
+- prod-web: 10.0.1.10 (nginx + app, Ubuntu 22.04)
+- prod-db: 10.0.1.20 (PostgreSQL 16, port 5433)
+- staging: 10.0.2.10 (everything-in-one)
+
+## Common tasks
+- Deploy: `cd /opt/app && git pull && docker compose up -d --build`
+- DB backup: `pg_dump -h prod-db -p 5433 -U app mydb > /backups/$(date +%F).sql`
+
+## Credentials
+- DB user: app (password in /opt/app/.env)
+- SSH: all servers use ~/.ssh/id_ed25519
+```
+
+This is optional but powerful — the AI starts every conversation already knowing your world.
 
 ---
 
