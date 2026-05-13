@@ -189,6 +189,10 @@ GCP_IP = os.getenv("GCP_SSH_HOST", "")
 GCP_USER = os.getenv("GCP_SSH_USER", "user")
 ROUTER_IP = os.getenv("ROUTER_IP", "")
 
+# Home Assistant (optional — for IoT control: lights, Alexa, sensors, etc.)
+HA_URL = os.getenv("HA_URL", "").rstrip("/")
+HA_TOKEN = os.getenv("HA_TOKEN", "")
+
 
 # ---------------------------------------------------------------------------
 # System prompt — TokioAI personality
@@ -220,8 +224,15 @@ TASKS_FILE = os.path.join(MEMORY_DIR, "tasks.json")
 # Leave empty to use local-only memory (default for open source users).
 TOKIO_AGENT_URL = os.getenv("TOKIO_AGENT_URL", "")
 
+AGENT_MEMORY_FILE = os.path.join(MEMORY_DIR, "agent_memory.md")
+
 def _sync_memory_from_agent():
-    """Download shared memory from TokioAI agent and merge with local."""
+    """Download consolidated memory from TokioAI agent.
+
+    Saves agent memory as a separate file (agent_memory.md) that gets
+    loaded alongside local memory. This avoids merge conflicts and ensures
+    the CLI always has the latest agent knowledge (HA entities, IoT learnings,
+    operational history, etc.)."""
     if not TOKIO_AGENT_URL:
         return
     try:
@@ -233,23 +244,9 @@ def _sync_memory_from_agent():
         remote = data.get("memory", "").strip()
         if not remote:
             return
-        local = ""
-        if os.path.isfile(MEMORY_FILE):
-            with open(MEMORY_FILE, "r") as f:
-                local = f.read().strip()
-        if not local:
-            # No local memory — use remote entirely
-            os.makedirs(MEMORY_DIR, exist_ok=True)
-            with open(MEMORY_FILE, "w") as f:
-                f.write(remote)
-            return
-        # Merge: if remote has lines not in local, append them
-        local_lines = set(local.splitlines())
-        new_lines = [l for l in remote.splitlines() if l.strip() and l not in local_lines]
-        if new_lines:
-            with open(MEMORY_FILE, "a") as f:
-                f.write("\n\n## [Synced from TokioAI Agent]\n")
-                f.write("\n".join(new_lines))
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        with open(AGENT_MEMORY_FILE, "w") as f:
+            f.write(remote)
     except Exception:
         pass  # silently skip if agent unreachable
 
@@ -303,12 +300,69 @@ def _save_tasks(tasks: list):
     with open(TASKS_FILE, "w") as f:
         f.write(json.dumps(tasks, indent=2, ensure_ascii=False))
 
+def _load_agent_memory() -> str:
+    """Load agent memory (synced from TokioAI Agent on startup).
+
+    The full agent memory can be very large (70KB+), so we keep only the
+    most useful sections: IoT learnings, HA entities, SOUL identity, and
+    the most recent operational entries from MEMORY.md (last 30).
+    """
+    if not os.path.isfile(AGENT_MEMORY_FILE):
+        return ""
+    try:
+        with open(AGENT_MEMORY_FILE, "r") as f:
+            full = f.read().strip()
+    except Exception:
+        return ""
+    if not full:
+        return ""
+
+    # Parse sections by ## [Source: ...] headers
+    sections = {}
+    current_key = ""
+    current_lines = []
+    for line in full.splitlines():
+        if line.startswith("## [Source:"):
+            if current_key:
+                sections[current_key] = "\n".join(current_lines)
+            current_key = line
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_key:
+        sections[current_key] = "\n".join(current_lines)
+
+    # Build concise output
+    parts = []
+
+    # IoT learnings — always include (small, high value)
+    for key, val in sections.items():
+        if "iot_learnings" in key:
+            parts.append(f"## IoT Learnings\n{val.strip()}")
+
+    # HA entities — compact list
+    for key, val in sections.items():
+        if "Home Assistant" in key:
+            parts.append(f"## Home Assistant Entities\n{val.strip()}")
+
+    # MEMORY.md — last 30 entries (most recent operational knowledge)
+    for key, val in sections.items():
+        if "MEMORY.md" in key:
+            lines = [l for l in val.strip().splitlines() if l.strip()]
+            recent = lines[-30:] if len(lines) > 30 else lines
+            parts.append(f"## Recent Agent Memory (last {len(recent)} entries)\n" + "\n".join(recent))
+
+    return "\n\n".join(parts)
+
 def _build_memory_context() -> str:
-    """Build memory + tasks context for system prompt."""
+    """Build memory + agent memory + tasks context for system prompt."""
     parts = []
     mem = _load_memory()
     if mem:
         parts.append(f"\n\n## Persistent Memory (~/.tokioai/memory.md)\n{mem}")
+    agent_mem = _load_agent_memory()
+    if agent_mem:
+        parts.append(f"\n\n## Agent Knowledge (synced from TokioAI Agent)\n{agent_mem}")
     tasks = _load_tasks()
     active = [t for t in tasks if t.get("status") != "done"]
     if active:
@@ -585,6 +639,35 @@ TOOLS = [
             "properties": {
                 "action": {"type": "string", "description": "Action to perform"},
                 "params": {"type": "object", "description": "Parameters for the action"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "home_assistant",
+        "description": (
+            "Control smart home devices via Home Assistant REST API. "
+            "Configure HA_URL and HA_TOKEN in .env. Actions:\n"
+            "- get_state: Get state of an entity. Params: entity_id\n"
+            "- call_service: Call any HA service. Params: domain, service, entity_id, data (optional dict)\n"
+            "  Examples: domain='light', service='turn_on', entity_id='light.living_room'\n"
+            "           domain='light', service='turn_on', entity_id='light.living_room', data={'brightness': 200, 'color_name': 'blue'}\n"
+            "           domain='media_player', service='volume_set', entity_id='media_player.jarvis', data={'volume_level': 0.5}\n"
+            "- alexa_play_music: Play music on Alexa. Params: query (search text), device (entity_id or name, default: first media_player)\n"
+            "- alexa_speak: Make Alexa speak text. Params: text, device (optional)\n"
+            "- list_entities: List all HA entities (optionally filtered). Params: domain (optional, e.g. 'light', 'media_player', 'switch')\n"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action: get_state, call_service, alexa_play_music, alexa_speak, list_entities"},
+                "entity_id": {"type": "string", "description": "HA entity ID (e.g. light.living_room)"},
+                "domain": {"type": "string", "description": "Service domain (e.g. light, switch, media_player)"},
+                "service": {"type": "string", "description": "Service name (e.g. turn_on, turn_off, toggle, volume_set)"},
+                "data": {"type": "object", "description": "Additional service data (brightness, color_name, volume_level, etc.)"},
+                "query": {"type": "string", "description": "Music search query for alexa_play_music"},
+                "text": {"type": "string", "description": "Text for alexa_speak"},
+                "device": {"type": "string", "description": "Alexa device entity_id or friendly name"},
             },
             "required": ["action"],
         },
@@ -922,6 +1005,9 @@ def execute_tool(name: str, input_data: dict) -> str:
         base_url = PIDOG_URL if name == "pidog" else PICAR_URL
         return _robot_request(base_url, action, params)
 
+    elif name == "home_assistant":
+        return _ha_execute(input_data)
+
     return f"ERROR: Unknown tool '{name}'"
 
 
@@ -981,6 +1067,196 @@ def _robot_request(base_url: str, action: str, params: dict = None) -> str:
             return f"ERROR: Robot no responde ({url}): {e.reason}"
         except Exception as e:
             return f"ERROR: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant integration
+# ---------------------------------------------------------------------------
+
+def _ha_request(method: str, path: str, json_payload: dict = None, timeout: int = 15):
+    """Make a request to the Home Assistant REST API. Returns (response_dict_or_list, error_str)."""
+    if not HA_URL:
+        return None, "HA_URL not configured. Set HA_URL in ~/.tokioai/.env"
+    if not HA_TOKEN:
+        return None, "HA_TOKEN not configured. Set HA_TOKEN in ~/.tokioai/.env"
+    import urllib.request
+    import urllib.error
+    url = f"{HA_URL}{path}"
+    body = json.dumps(json_payload).encode("utf-8") if json_payload else None
+    req = urllib.request.Request(url, data=body, method=method.upper())
+    req.add_header("Authorization", f"Bearer {HA_TOKEN}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="replace")
+        return json.loads(data) if data.strip() else {}, ""
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:400] if e.fp else ""
+        return None, f"HTTP {e.code}: {body}"
+    except urllib.error.URLError as e:
+        return None, f"Connection error: {e.reason}"
+    except Exception as e:
+        return None, str(e)
+
+
+def _ha_execute(input_data: dict) -> str:
+    """Execute a Home Assistant action."""
+    action = input_data.get("action", "")
+
+    if action == "get_state":
+        entity_id = input_data.get("entity_id", "")
+        if not entity_id:
+            return "ERROR: entity_id required for get_state"
+        data, err = _ha_request("GET", f"/api/states/{entity_id}")
+        if err:
+            return f"ERROR: {err}"
+        state = data.get("state", "unknown")
+        attrs = data.get("attributes", {})
+        friendly = attrs.get("friendly_name", entity_id)
+        parts = [f"{friendly}: {state}"]
+        for k in ("brightness", "color_temp", "rgb_color", "volume_level",
+                   "media_title", "media_artist", "source", "temperature",
+                   "humidity", "battery_level", "unit_of_measurement"):
+            if k in attrs:
+                parts.append(f"  {k}: {attrs[k]}")
+        return "\n".join(parts)
+
+    elif action == "call_service":
+        domain = input_data.get("domain", "")
+        service = input_data.get("service", "")
+        entity_id = input_data.get("entity_id", "")
+        extra_data = input_data.get("data", {})
+        if not domain or not service:
+            return "ERROR: domain and service required for call_service"
+        payload = {}
+        if entity_id:
+            payload["entity_id"] = entity_id
+        if extra_data:
+            payload.update(extra_data)
+        data, err = _ha_request("POST", f"/api/services/{domain}/{service}", json_payload=payload)
+        if err:
+            return f"ERROR: {err}"
+        return f"OK: {domain}/{service} called" + (f" on {entity_id}" if entity_id else "")
+
+    elif action == "alexa_play_music":
+        query = input_data.get("query", "")
+        device = input_data.get("device", "")
+        if not query:
+            return "ERROR: query required for alexa_play_music"
+        # Resolve device — find first media_player if not specified
+        entity_id = _ha_resolve_media_player(device)
+        # Turn on and set volume
+        _ha_request("POST", "/api/services/media_player/turn_on",
+                    json_payload={"entity_id": entity_id}, timeout=10)
+        _ha_request("POST", "/api/services/media_player/volume_set",
+                    json_payload={"entity_id": entity_id, "volume_level": 0.35}, timeout=10)
+        # Try AMAZON_MUSIC first
+        _, err1 = _ha_request("POST", "/api/services/media_player/play_media",
+                              json_payload={"entity_id": entity_id,
+                                           "media_content_type": "AMAZON_MUSIC",
+                                           "media_content_id": query})
+        if not err1:
+            time.sleep(2)
+            playing = _ha_check_playing(entity_id)
+            if playing:
+                return playing
+        # Try generic music type
+        _, err2 = _ha_request("POST", "/api/services/media_player/play_media",
+                              json_payload={"entity_id": entity_id,
+                                           "media_content_type": "music",
+                                           "media_content_id": query})
+        if not err2:
+            time.sleep(2)
+            playing = _ha_check_playing(entity_id)
+            if playing:
+                return playing
+        # Fallback: alexa_media notify (voice command)
+        _, err3 = _ha_request("POST", "/api/services/notify/alexa_media",
+                              json_payload={"message": f"play {query}",
+                                           "target": [entity_id],
+                                           "data": {"type": "announce"}})
+        if not err3:
+            time.sleep(3)
+            playing = _ha_check_playing(entity_id)
+            if playing:
+                return playing
+            return f"Command sent to {entity_id}: play {query}"
+        return f"ERROR: Could not play music. Errors: {err1 or ''} | {err2 or ''} | {err3 or ''}"
+
+    elif action == "alexa_speak":
+        text = input_data.get("text", "")
+        device = input_data.get("device", "")
+        if not text:
+            return "ERROR: text required for alexa_speak"
+        entity_id = _ha_resolve_media_player(device)
+        # Try notify/alexa_media (TTS)
+        _, err = _ha_request("POST", "/api/services/notify/alexa_media",
+                             json_payload={"message": text,
+                                          "target": [entity_id],
+                                          "data": {"type": "tts"}})
+        if not err:
+            return f"OK: Alexa speaking on {entity_id}: '{text}'"
+        # Fallback: media_player/play_media with TTS
+        _, err2 = _ha_request("POST", "/api/services/media_player/play_media",
+                              json_payload={"entity_id": entity_id,
+                                           "media_content_id": text,
+                                           "media_content_type": "tts"})
+        if not err2:
+            return f"OK: TTS sent to {entity_id}: '{text}'"
+        return f"ERROR: Could not send TTS. {err} | {err2}"
+
+    elif action == "list_entities":
+        domain_filter = input_data.get("domain", "")
+        data, err = _ha_request("GET", "/api/states")
+        if err:
+            return f"ERROR: {err}"
+        if not isinstance(data, list):
+            return "ERROR: Unexpected response format"
+        lines = []
+        for entity in data:
+            eid = entity.get("entity_id", "")
+            if domain_filter and not eid.startswith(f"{domain_filter}."):
+                continue
+            state = entity.get("state", "unknown")
+            friendly = entity.get("attributes", {}).get("friendly_name", "")
+            label = f"{friendly} ({eid})" if friendly else eid
+            lines.append(f"- {label}: {state}")
+        if not lines:
+            return f"No entities found" + (f" for domain '{domain_filter}'" if domain_filter else "")
+        return f"Found {len(lines)} entities:\n" + "\n".join(sorted(lines))
+
+    return f"ERROR: Unknown home_assistant action '{action}'. Use: get_state, call_service, alexa_play_music, alexa_speak, list_entities"
+
+
+def _ha_resolve_media_player(device: str) -> str:
+    """Resolve a device name/id to a media_player entity_id."""
+    if not device:
+        # Try to find first media_player
+        data, err = _ha_request("GET", "/api/states", timeout=10)
+        if not err and isinstance(data, list):
+            for entity in data:
+                eid = entity.get("entity_id", "")
+                if eid.startswith("media_player."):
+                    return eid
+        return "media_player.jarvis"  # fallback
+    if device.startswith("media_player."):
+        return device
+    slug = device.lower().replace(" ", "_")
+    return f"media_player.{slug}"
+
+
+def _ha_check_playing(entity_id: str) -> str:
+    """Check if a media_player is currently playing. Returns status string or empty."""
+    data, err = _ha_request("GET", f"/api/states/{entity_id}", timeout=10)
+    if err or not data:
+        return ""
+    if data.get("state") == "playing":
+        attrs = data.get("attributes", {})
+        title = attrs.get("media_title", "")
+        artist = attrs.get("media_artist", "")
+        now = f" ({title}" + (f" - {artist})" if artist else ")") if title else ""
+        return f"Playing on {entity_id}{now}"
+    return ""
 
 
 # ---------------------------------------------------------------------------

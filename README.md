@@ -26,7 +26,7 @@ No copy-pasting commands. No "here's what you should do". It **does it**.
 
 ## What it actually does
 
-TokioAI gives AI models 14 tools to interact with your world:
+TokioAI gives AI models 15 tools to interact with your world:
 
 | Tool | What it does |
 |------|-------------|
@@ -44,6 +44,7 @@ TokioAI gives AI models 14 tools to interact with your world:
 | `tasks` | Track tasks with status (pending, in_progress, done, blocked) |
 | `pidog` | Control a PiDog robot via HTTP API |
 | `picar` | Control a PiCar-X robot via HTTP API |
+| `home_assistant` | Control smart home via Home Assistant (lights, Alexa, sensors, switches) |
 
 These aren't gimmicks. They use **native function calling** — the same tool-use protocol built into Claude, GPT, and Gemini's APIs. The model decides what tool to call, with what arguments, inspects the result, and decides the next step. Multiple rounds. No regex parsing. No prompt hacking.
 
@@ -341,6 +342,44 @@ The robots work alongside all other tools — you can combine robot control with
 
 ---
 
+## Smart home (Home Assistant)
+
+TokioAI can control your smart home through [Home Assistant](https://www.home-assistant.io/). Lights, speakers, Alexa, switches, sensors, vacuum robots — anything HA can control, TokioAI can control.
+
+Configure in `~/.tokioai/.env`:
+
+```bash
+HA_URL=http://your-homeassistant-ip:8123
+HA_TOKEN=your-long-lived-access-token
+```
+
+To create a long-lived access token: HA web UI → Profile → Long-Lived Access Tokens → Create Token.
+
+The `home_assistant` tool supports:
+
+| Action | What it does |
+|--------|-------------|
+| `list_entities` | List all HA entities (optionally filtered by domain) |
+| `get_state` | Get current state of any entity (lights, sensors, media players) |
+| `call_service` | Call any HA service (turn_on, turn_off, volume_set, etc.) |
+| `alexa_play_music` | Play music on Alexa/Echo devices via HA |
+| `alexa_speak` | Make Alexa speak text (TTS) |
+
+```
+you > "turn on the living room lights and play jazz on Alexa"
+
+TokioAI:
+  [home_assistant] list_entities: domain=light
+  [home_assistant] call_service: light/turn_on on light.living_room
+  [home_assistant] alexa_play_music: "jazz" on media_player.jarvis
+
+  Done! Living room lights are on and jazz is playing on Alexa.
+```
+
+If `HA_URL` and `HA_TOKEN` are not set, the tool simply isn't available — no errors, no impact on other functionality.
+
+---
+
 ## Context management
 
 Long sessions don't lose context. TokioAI tracks token usage per model and auto-compacts old messages when the context window fills up. The important stuff stays — the noise gets summarized.
@@ -396,6 +435,13 @@ All configuration goes in `~/.tokioai/.env`. See `.env.example` for a full templ
 |----------|-------------|
 | `PIDOG_URL` | PiDog robot proxy URL (e.g., `http://192.168.1.50:5001`) |
 | `PICAR_URL` | PiCar-X robot proxy URL (e.g., `http://192.168.1.51:5002`) |
+
+### Home Assistant (optional)
+
+| Variable | Description |
+|----------|-------------|
+| `HA_URL` | Home Assistant URL (e.g., `http://192.168.1.100:8123`) |
+| `HA_TOKEN` | Home Assistant long-lived access token |
 
 ### Memory sync (optional)
 
