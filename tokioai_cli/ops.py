@@ -680,9 +680,15 @@ TOOLS = [
             "- connect: Connect to drone WiFi. Params: ssid (e.g. TELLO-XXXXX)\n"
             "- disconnect: Disconnect from drone WiFi\n"
             "- wifi_status: Check WiFi connection status\n"
-            "- command: Send a drone command. Params: cmd (takeoff, land, up/down/left/right/forward/back + distance, "
-            "cw/ccw + degrees, flip, battery?, speed?), speed (optional)\n"
-            "  IMPORTANT: Always check status first. Never fly without confirming battery > 25%.\n"
+            "- command: Send a drone command. Params: cmd, params (optional dict)\n"
+            "  Available commands:\n"
+            "    takeoff — take off\n"
+            "    land — land\n"
+            "    battery — check battery level\n"
+            "    move — move in a direction. params: {direction: forward/back/left/right/up/down, distance: cm (max 200)}\n"
+            "    rotate — rotate. params: {direction: clockwise/counterclockwise, degrees: 1-360}\n"
+            "    emergency — emergency motor stop\n"
+            "  IMPORTANT: Always check status/battery first. Never fly below 25% battery.\n"
             "- kill: Emergency stop — cuts motors immediately\n"
             "- kill_reset: Reset kill switch after emergency stop\n"
             "- snapshot: Take a photo from the drone camera\n"
@@ -693,8 +699,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "action": {"type": "string", "description": "Action: status, connect, disconnect, wifi_status, command, kill, kill_reset, snapshot, geofence, audit"},
-                "cmd": {"type": "string", "description": "Drone command for 'command' action (e.g. takeoff, land, up 50, forward 100, cw 90)"},
-                "speed": {"type": "integer", "description": "Speed for movement commands (10-100)"},
+                "cmd": {"type": "string", "description": "Drone command: takeoff, land, battery, move, rotate, emergency"},
+                "params": {"type": "object", "description": "Command params. For move: {direction, distance}. For rotate: {direction, degrees}"},
                 "ssid": {"type": "string", "description": "Drone WiFi SSID for 'connect' action (e.g. TELLO-XXXXX)"},
             },
             "required": ["action"],
@@ -1311,7 +1317,7 @@ def _drone_execute(input_data: dict) -> str:
         "connect":     ("POST", "/drone/wifi/connect",     {"ssid": input_data.get("ssid", "")}),
         "disconnect":  ("POST", "/drone/wifi/disconnect",  {}),
         "wifi_status": ("GET",  "/drone/wifi/status",      None),
-        "command":     ("POST", "/drone/command",          {"command": input_data.get("cmd", ""), "speed": input_data.get("speed")}),
+        "command":     ("POST", "/drone/command",          {"command": input_data.get("cmd", ""), "params": input_data.get("params", {})}),
         "kill":        ("POST", "/drone/kill",             {}),
         "kill_reset":  ("POST", "/drone/kill/reset",       {}),
         "snapshot":    ("POST", "/drone/snapshot",         {}),
